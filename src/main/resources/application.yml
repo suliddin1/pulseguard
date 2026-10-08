@@ -48,3 +48,13 @@ logging:
     root: INFO
     com.pulseguard: DEBUG
     org.hibernate.SQL: WARN
+
+pulseguard:
+  scheduler:
+    enabled: ${PULSEGUARD_SCHEDULER_ENABLED:true}
+    polling-interval-ms: ${PULSEGUARD_SCHEDULER_POLL_INTERVAL_MS:5000}
+    initial-delay-ms: ${PULSEGUARD_SCHEDULER_INITIAL_DELAY_MS:2000}
+    max-concurrent-checks: ${PULSEGUARD_MAX_CONCURRENT_CHECKS:10}
+    queue-capacity: ${PULSEGUARD_SCHEDULER_QUEUE_CAPACITY:100}
+    termination-timeout-seconds: ${PULSEGUARD_SCHEDULER_TERMINATION_TIMEOUT_SECONDS:30}
+

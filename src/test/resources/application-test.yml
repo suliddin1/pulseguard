@@ -27,3 +27,13 @@ logging:
   level:
     root: WARN
     com.pulseguard: DEBUG
+
+pulseguard:
+  scheduler:
+    enabled: false
+    polling-interval-ms: 10000
+    initial-delay-ms: 10000
+    max-concurrent-checks: 5
+    queue-capacity: 20
+    termination-timeout-seconds: 5
+

@@ -160,6 +160,70 @@ PulseGuard features an HTTP health probing mechanism built on modern Java 21 sta
 
 ---
 
+## Automated Background Scheduling Engine
+
+PulseGuard features an automated background scheduling subsystem that executes periodic health checks according to each service's configured `checkIntervalSeconds`:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 Spring @Scheduled Poller                    │
+│            (fixedDelayString = "pollingIntervalMs")          │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Polls enabled services
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    DueCheckEvaluator                        │
+│   - Checks lastCheckedAt + checkIntervalSeconds <= now      │
+│   - New/unverified services scheduled immediately           │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Eligible service IDs
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Same-Service Overlap Protection                │
+│   - Atomic check reservation via ConcurrentHashSet          │
+│   - Skips tick if check is already running for service      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Dispatches check task
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│          Bounded ThreadPoolTaskExecutor (Worker Pool)       │
+│   - Core / Max Pool Size: configurable (e.g. 10 workers)    │
+│   - Queue Capacity: configurable (e.g. 50 tasks)            │
+│   - Rejection Policy: AbortPolicy with graceful catch       │
+│   - Graceful Shutdown: waitForTasksToCompleteOnShutdown     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Scheduling Capabilities
+
+1. **Independent Per-Service Intervals**: Each service defines its own `checkIntervalSeconds` (e.g. Service A every 10s, Service B every 60s, Service C every 5m). The engine dynamically evaluates due status on every tick without creating unbounded threads per service.
+2. **Bounded Concurrency & Backpressure**: Background checks execute on a dedicated Spring `ThreadPoolTaskExecutor`. When queue capacity is reached, rejections are handled gracefully without aborting the poller.
+3. **Same-Service Overlap Protection**: If a previous check for Service A is still executing or timing out, subsequent scheduler cycles skip Service A until the existing check finishes, preventing check pile-ups.
+4. **Slow Service & Fault Isolation**: Long response times or uncaught exceptions from one service do not block or delay health checks of other services.
+5. **Dynamic Eligibility**: Newly added or re-enabled services become immediately eligible for monitoring without requiring an application restart.
+6. **Graceful Application Shutdown**: The worker pool is configured with `setWaitForTasksToCompleteOnShutdown(true)` and an await termination timeout, ensuring active probes complete cleanly during SIGTERM/shutdown.
+7. **Production Observability & Metrics**: Built-in thread-safe counters and Micrometer metrics track:
+   - `pulseguard.scheduler.scheduled`: Total checks scheduled
+   - `pulseguard.scheduler.started`: Checks that began execution
+   - `pulseguard.scheduler.completed`: Successfully finished check tasks
+   - `pulseguard.scheduler.failed`: Checks that threw unexpected exceptions
+   - `pulseguard.scheduler.skipped`: Due checks skipped due to an in-flight check
+   - `pulseguard.scheduler.rejected`: Checks rejected due to executor capacity exhaustion
+   - `pulseguard.scheduler.inflight`: Current number of concurrently running checks
+
+### Scheduler Configuration Properties
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `pulseguard.scheduler.enabled` | `true` | Master toggle to enable or disable the background scheduling engine |
+| `pulseguard.scheduler.polling-interval-ms` | `5000` | Delay between polling iterations in milliseconds |
+| `pulseguard.scheduler.initial-delay-ms` | `2000` | Delay after startup before the initial polling cycle begins |
+| `pulseguard.scheduler.max-concurrent-checks` | `10` | Maximum worker threads in the health check thread pool |
+| `pulseguard.scheduler.queue-capacity` | `50` | Maximum queue size for pending health check tasks |
+| `pulseguard.scheduler.termination-timeout-seconds` | `30` | Maximum grace period for in-flight tasks during shutdown |
+
+---
+
 ## REST API Specification
 
 ### Service Management (`/api/v1/services`)
@@ -351,9 +415,11 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 
 * **Domain Unit Tests** (`MonitoredServiceTest`, `HealthCheckTest`): Validates entity lifecycle, state mutations, clamping, and invariant enforcement.
 * **Prober Unit Tests** (`JavaHttpHealthProberTest`): Validates HTTP probing, latency measurement, timeout handling, and connection error handling using an embedded JDK `HttpServer`.
+* **Scheduler Unit Tests** (`DueCheckEvaluatorTest`, `HealthCheckSchedulerTest`): Validates dynamic due evaluation across unverified/verified services, time interval boundaries, overlap protection, and executor capacity rejection.
+* **Scheduler Concurrency & Lifecycle Tests** (`SchedulerConcurrencyTest`, `SchedulerLifecycleIntegrationTest`): Tests parallel multi-service execution, slow-service non-blocking guarantees via synchronization latches, and Spring Boot application lifecycle startup/shutdown.
 * **Service Layer Unit Tests** (`ServiceManagementServiceTest`, `HealthCheckExecutionServiceTest`): Tests business logic, unique constraints, health check execution, and repository interactions using Mockito.
 * **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`): Validates HTTP contract, Bean Validation rules, JSON serialization, and error mapping using `MockMvc`.
-* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1` and `V2`), historical ordering, and cascade deletes with `@DataJpaTest`.
+* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1` and `V2`), historical ordering, group aggregation queries, and cascade deletes with `@DataJpaTest`.
 * **PostgreSQL Testcontainers** (`PulseGuardPostgresTestcontainersIntegrationTest`): Runs end-to-end against real PostgreSQL when a Docker daemon is available.
 
 ---
@@ -362,6 +428,6 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 
 * **Phase 1 (Completed)**: Core service registry foundation, PostgreSQL + Flyway persistence, layered architecture, DTO isolation, Bean Validation, Global Exception Handling, and comprehensive test suite.
 * **Phase 2 (Completed)**: Health Check Execution Engine with standard Java 21 `HttpClient`, latency measurement, status code capturing, manual check trigger (`POST /api/v1/services/{id}/checks`), historical checks pagination (`GET /api/v1/services/{id}/checks`), and Flyway `V2` migration.
-* **Phase 3**: Automated background scheduler, incident generation rules, recovery detection, and incident resolution lifecycles (`/api/v1/services/{id}/incidents`).
-* **Phase 4**: Anomaly detection algorithms, alerting channels (Slack, Webhooks, Email), and observability dashboards.
+* **Phase 3 (Completed)**: Automated background scheduling engine with bounded `ThreadPoolTaskExecutor`, independent per-service check intervals, same-service overlap protection, failure isolation, graceful shutdown, and scheduler Micrometer metrics.
+* **Phase 4**: Incident generation & recovery engine, incident lifecycle (`/api/v1/services/{id}/incidents`), anomaly detection algorithms, and alerting channels (Slack, Webhooks, Email).
 

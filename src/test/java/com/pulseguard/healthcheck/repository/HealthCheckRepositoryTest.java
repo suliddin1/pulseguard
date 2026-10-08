@@ -151,4 +151,41 @@ class HealthCheckRepositoryTest {
         // Verify check is removed via cascade
         assertThat(healthCheckRepository.findById(checkId)).isEmpty();
     }
+
+    @Test
+    @DisplayName("Should find top latest check by service ID")
+    void shouldFindTopByServiceId() {
+        MonitoredService service = new MonitoredService(
+                "Top Check API", null, "https://top.example.com", 60, 5000
+        );
+        entityManager.persist(service);
+
+        HealthCheck older = new HealthCheck(service, 100L, 200, HealthCheckResult.SUCCESS, null);
+        entityManager.persist(older);
+
+        HealthCheck newer = new HealthCheck(service, 120L, 200, HealthCheckResult.SUCCESS, null);
+        entityManager.persistAndFlush(newer);
+
+        Optional<HealthCheck> latest = healthCheckRepository.findTopByServiceIdOrderByCheckedAtDesc(service.getId());
+        assertThat(latest).isPresent();
+        assertThat(latest.get().getId()).isEqualTo(newer.getId());
+    }
+
+    @Test
+    @DisplayName("Should query latest check timestamps grouped by service ID")
+    void shouldFindLatestCheckTimesGroupedByService() {
+        MonitoredService s1 = new MonitoredService("Group API 1", null, "https://g1.example.com", 60, 5000);
+        MonitoredService s2 = new MonitoredService("Group API 2", null, "https://g2.example.com", 60, 5000);
+        entityManager.persist(s1);
+        entityManager.persist(s2);
+
+        HealthCheck c1 = new HealthCheck(s1, 100L, 200, HealthCheckResult.SUCCESS, null);
+        HealthCheck c2 = new HealthCheck(s2, 100L, 200, HealthCheckResult.SUCCESS, null);
+        entityManager.persist(c1);
+        entityManager.persist(c2);
+        entityManager.flush();
+
+        java.util.List<Object[]> results = healthCheckRepository.findLatestCheckTimesGroupedByService();
+        assertThat(results).hasSize(2);
+    }
 }
