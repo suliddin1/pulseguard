@@ -88,10 +88,11 @@ PulseGuard follows a clean layered architecture with clear separation of concern
 
 ---
 
-## Database Schema (Phase 1)
+## Database Schema
 
-Flyway migration script: `src/main/resources/db/migration/V1__create_services_table.sql`
+Database migrations are managed via version-controlled Flyway scripts:
 
+### Phase 1 — Monitored Services (`V1__create_services_table.sql`)
 ```sql
 CREATE TABLE IF NOT EXISTS services (
     id UUID PRIMARY KEY,
@@ -114,13 +115,56 @@ CREATE INDEX idx_services_enabled ON services(enabled);
 CREATE INDEX idx_services_created_at ON services(created_at);
 ```
 
+### Phase 2 — Health Checks (`V2__create_health_checks_table.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS health_checks (
+    id UUID PRIMARY KEY,
+    service_id UUID NOT NULL,
+    checked_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    response_time_ms BIGINT NOT NULL,
+    http_status_code INTEGER,
+    result VARCHAR(30) NOT NULL,
+    error_message VARCHAR(1000),
+    CONSTRAINT fk_health_checks_service FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+    CONSTRAINT chk_health_checks_response_time CHECK (response_time_ms >= 0)
+);
+
+CREATE INDEX idx_health_checks_service_id ON health_checks(service_id);
+CREATE INDEX idx_health_checks_checked_at ON health_checks(checked_at);
+CREATE INDEX idx_health_checks_service_checked_at ON health_checks(service_id, checked_at DESC);
+CREATE INDEX idx_health_checks_result ON health_checks(result);
+```
+
+---
+
+## Health Check Engine
+
+PulseGuard features an HTTP health probing mechanism built on modern Java 21 standard library capabilities (`java.net.http.HttpClient`):
+
+### 1. Probe Lifecycle
+1. **Validation & Resolution**: Resolves target service URL, verifies the service is enabled, and enforces configured per-service timeout limits.
+2. **Probing**: Dispatches non-blocking HTTP GET requests using `HttpResponse.BodyHandlers.discarding()`, preventing heap memory allocation from large remote response payloads.
+3. **High-Precision Timing**: Measures execution latency at millisecond precision using `System.nanoTime()`.
+4. **Fault Tolerance**: Isolates external service failures (DNS errors, connection refusals, timeouts, HTTP 5xx). External service failures never crash the monitoring engine.
+5. **Atomic State Transition**: Persists the check execution record and transitions the service's health status in a single transaction.
+
+### 2. Check Result States
+* **`SUCCESS`**: The target endpoint responded with an HTTP `2xx` status code within the configured timeout.
+* **`FAILURE`**: The endpoint returned an HTTP non-2xx status code (e.g. 404, 500, 503) or an I/O error occurred (connection refused, host unreachable, malformed URL).
+* **`TIMEOUT`**: The target failed to respond within the service's configured `timeoutMs` threshold.
+
+### 3. Service Status Transitions
+* **Transition to `HEALTHY`**: Triggered when a health check yields `SUCCESS`.
+* **Transition to `UNHEALTHY`**: Triggered when a health check yields `FAILURE` or `TIMEOUT`.
+* **Disabled Services**: Services marked `enabled: false` reject manual and scheduled probes with HTTP 400 Bad Request (`ServiceDisabledException`), protecting inactive workloads.
+
 ---
 
 ## REST API Specification
 
-Base URI: `/api/v1/services`
+### Service Management (`/api/v1/services`)
 
-### 1. Register Monitored Service
+#### 1. Register Monitored Service
 * **Endpoint**: `POST /api/v1/services`
 * **Status**: `201 Created`
 * **Headers**: `Location: /api/v1/services/{id}`
@@ -152,7 +196,7 @@ Base URI: `/api/v1/services`
 }
 ```
 
-### 2. List Monitored Services
+#### 2. List Monitored Services
 * **Endpoint**: `GET /api/v1/services`
 * **Query Parameters**:
   * `enabled` (optional, boolean): Filter by active status (`true` / `false`)
@@ -162,39 +206,77 @@ Base URI: `/api/v1/services`
   * `sort` (optional, string, default `createdAt,desc`): Sort property and direction
 * **Status**: `200 OK`
 
-### 3. Get Service by ID
+#### 3. Get Service by ID
 * **Endpoint**: `GET /api/v1/services/{id}`
 * **Status**: `200 OK` (or `404 Not Found`)
 
-### 4. Update Service Configuration
+#### 4. Update Service Configuration
 * **Endpoint**: `PUT /api/v1/services/{id}`
 * **Status**: `200 OK`
 
-**Request Body**:
-```json
-{
-  "name": "Payment Gateway API (v2)",
-  "description": "Updated cluster configuration",
-  "url": "https://api-v2.payment.internal/health",
-  "checkIntervalSeconds": 15,
-  "timeoutMs": 2500
-}
-```
-
-### 5. Toggle Service Enabled Status
+#### 5. Toggle Service Enabled Status
 * **Endpoint**: `PATCH /api/v1/services/{id}/status`
 * **Status**: `200 OK`
 
-**Request Body**:
+#### 6. Delete Monitored Service
+* **Endpoint**: `DELETE /api/v1/services/{id}`
+* **Status**: `204 No Content` (cascades deletion of historical health checks)
+
+---
+
+### Health Check Engine (`/api/v1/services/{id}/checks`)
+
+#### 7. Trigger Manual Health Check
+* **Endpoint**: `POST /api/v1/services/{serviceId}/checks`
+* **Status**: `200 OK`
+
+**Response Body**:
 ```json
 {
-  "enabled": false
+  "id": "b103e33f-8012-4217-bf20-7469a5ad5682",
+  "serviceId": "c56a4180-65aa-42ec-a945-5fd21dec0538",
+  "serviceName": "Payment Gateway API",
+  "checkedAt": "2026-10-08T17:31:15.820Z",
+  "responseTimeMs": 112,
+  "httpStatusCode": 200,
+  "result": "SUCCESS",
+  "errorMessage": null
 }
 ```
 
-### 6. Delete Monitored Service
-* **Endpoint**: `DELETE /api/v1/services/{id}`
-* **Status**: `204 No Content` (or `404 Not Found`)
+#### 8. Retrieve Historical Health Checks
+* **Endpoint**: `GET /api/v1/services/{serviceId}/checks`
+* **Query Parameters**:
+  * `from` (optional, ISO-8601 timestamp): Filter checks after this timestamp (e.g. `2026-10-08T00:00:00Z`)
+  * `to` (optional, ISO-8601 timestamp): Filter checks before this timestamp (e.g. `2026-10-08T23:59:59Z`)
+  * `page` (optional, int, default `0`): Page index
+  * `size` (optional, int, default `20`, max `100`): Page size
+  * `sort` (optional, string, default `checkedAt,desc`): Newest checks first
+* **Status**: `200 OK`
+
+**Response Body**:
+```json
+{
+  "content": [
+    {
+      "id": "b103e33f-8012-4217-bf20-7469a5ad5682",
+      "serviceId": "c56a4180-65aa-42ec-a945-5fd21dec0538",
+      "serviceName": "Payment Gateway API",
+      "checkedAt": "2026-10-08T17:31:15.820Z",
+      "responseTimeMs": 112,
+      "httpStatusCode": 200,
+      "result": "SUCCESS",
+      "errorMessage": null
+    }
+  ],
+  "pageable": {
+    "pageNumber": 0,
+    "pageSize": 20
+  },
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
 
 ---
 
@@ -214,11 +296,6 @@ All error responses adhere to a consistent structure:
       "field": "url",
       "rejectedValue": "invalid-url",
       "message": "URL must be a valid HTTP or HTTPS address"
-    },
-    {
-      "field": "checkIntervalSeconds",
-      "rejectedValue": 2,
-      "message": "Check interval must be at least 5 seconds"
     }
   ]
 }
@@ -239,24 +316,12 @@ All error responses adhere to a consistent structure:
 docker compose up -d
 ```
 
-Verify PostgreSQL is running:
-```bash
-docker compose ps
-```
-
 ### 2. Configure Environment Variables
 
 Copy `.env.example` to `.env` or set environment variables:
 ```bash
 cp .env.example .env
 ```
-
-Default local database connection values:
-- **Host**: `localhost`
-- **Port**: `5432`
-- **Database**: `pulseguard`
-- **Username**: `pulseguard_user`
-- **Password**: `pulseguard_secret_change_in_production`
 
 ### 3. Build & Run Application
 
@@ -284,10 +349,11 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 .\mvnw.cmd test
 ```
 
-* **Domain Unit Tests** (`MonitoredServiceTest`): Validates entity lifecycle, state mutations, and invariant enforcement.
-* **Service Layer Unit Tests** (`ServiceManagementServiceTest`): Tests business logic, unique constraints, and repository interactions using Mockito.
-* **Controller Slice Tests** (`ServiceControllerTest`): Validates HTTP contract, Bean Validation rules, JSON serialization, and error mapping using `MockMvc`.
-* **Repository Slice Tests** (`ServiceRepositoryTest`): Tests JPA mappings, Flyway migrations, and custom query derivation with `@DataJpaTest`.
+* **Domain Unit Tests** (`MonitoredServiceTest`, `HealthCheckTest`): Validates entity lifecycle, state mutations, clamping, and invariant enforcement.
+* **Prober Unit Tests** (`JavaHttpHealthProberTest`): Validates HTTP probing, latency measurement, timeout handling, and connection error handling using an embedded JDK `HttpServer`.
+* **Service Layer Unit Tests** (`ServiceManagementServiceTest`, `HealthCheckExecutionServiceTest`): Tests business logic, unique constraints, health check execution, and repository interactions using Mockito.
+* **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`): Validates HTTP contract, Bean Validation rules, JSON serialization, and error mapping using `MockMvc`.
+* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1` and `V2`), historical ordering, and cascade deletes with `@DataJpaTest`.
 * **PostgreSQL Testcontainers** (`PulseGuardPostgresTestcontainersIntegrationTest`): Runs end-to-end against real PostgreSQL when a Docker daemon is available.
 
 ---
@@ -295,6 +361,7 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 ## Roadmap
 
 * **Phase 1 (Completed)**: Core service registry foundation, PostgreSQL + Flyway persistence, layered architecture, DTO isolation, Bean Validation, Global Exception Handling, and comprehensive test suite.
-* **Phase 2**: Non-blocking asynchronous health check execution engine, latency tracking, HTTP status recording, and manual triggers (`/api/v1/services/{id}/checks`).
+* **Phase 2 (Completed)**: Health Check Execution Engine with standard Java 21 `HttpClient`, latency measurement, status code capturing, manual check trigger (`POST /api/v1/services/{id}/checks`), historical checks pagination (`GET /api/v1/services/{id}/checks`), and Flyway `V2` migration.
 * **Phase 3**: Automated background scheduler, incident generation rules, recovery detection, and incident resolution lifecycles (`/api/v1/services/{id}/incidents`).
 * **Phase 4**: Anomaly detection algorithms, alerting channels (Slack, Webhooks, Email), and observability dashboards.
+

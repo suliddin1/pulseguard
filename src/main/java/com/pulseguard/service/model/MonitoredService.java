@@ -1,5 +1,6 @@
 package com.pulseguard.service.model;
 
+import com.pulseguard.healthcheck.model.HealthCheckResult;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EntityListeners;
@@ -104,6 +105,24 @@ public class MonitoredService {
 
     public void updateStatus(ServiceStatus newStatus) {
         this.status = Objects.requireNonNull(newStatus, "Status must not be null");
+        this.updatedAt = Instant.now();
+    }
+
+    /**
+     * Updates service status based on the outcome of a health check execution.
+     * Business transition rule:
+     * - SUCCESS -> HEALTHY
+     * - FAILURE or TIMEOUT -> UNHEALTHY
+     *
+     * @param result the outcome of the health check probe
+     */
+    public void recordHealthCheckOutcome(HealthCheckResult result) {
+        Objects.requireNonNull(result, "HealthCheckResult must not be null");
+        if (result == HealthCheckResult.SUCCESS) {
+            this.status = ServiceStatus.HEALTHY;
+        } else {
+            this.status = ServiceStatus.UNHEALTHY;
+        }
         this.updatedAt = Instant.now();
     }
 

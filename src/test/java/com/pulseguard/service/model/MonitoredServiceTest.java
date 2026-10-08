@@ -121,4 +121,27 @@ class MonitoredServiceTest {
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("URL must not be null");
     }
+
+    @Test
+    @DisplayName("Should transition status to HEALTHY when check succeeds, and UNHEALTHY when it fails or times out")
+    void shouldTransitionStatusOnHealthCheckOutcome() {
+        MonitoredService service = new MonitoredService(
+                "API Gateway",
+                null,
+                "https://gw.example.com/health",
+                60,
+                5000
+        );
+
+        assertThat(service.getStatus()).isEqualTo(ServiceStatus.UNKNOWN);
+
+        service.recordHealthCheckOutcome(com.pulseguard.healthcheck.model.HealthCheckResult.SUCCESS);
+        assertThat(service.getStatus()).isEqualTo(ServiceStatus.HEALTHY);
+
+        service.recordHealthCheckOutcome(com.pulseguard.healthcheck.model.HealthCheckResult.FAILURE);
+        assertThat(service.getStatus()).isEqualTo(ServiceStatus.UNHEALTHY);
+
+        service.recordHealthCheckOutcome(com.pulseguard.healthcheck.model.HealthCheckResult.TIMEOUT);
+        assertThat(service.getStatus()).isEqualTo(ServiceStatus.UNHEALTHY);
+    }
 }
