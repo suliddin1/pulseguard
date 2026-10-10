@@ -579,10 +579,296 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 
 ---
 
+## Phase 5 — Notification & Alerting Dispatcher Engine
+
+PulseGuard incorporates a production-grade, highly reliable alerting and notification dispatcher engine that reacts to incident lifecycle events (`INCIDENT_OPENED`, `INCIDENT_OCCURRENCE`, `INCIDENT_RESOLVED`).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Incident State Transition                             │
+│                  (Opened / Occurrence / Resolved)                           │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ Enqueue in same DB transaction
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   Transactional Outbox (notification_outbox)                │
+│  - One snapshot row per enabled channel                                     │
+│  - Unique constraint (event_id, channel) guarantees idempotency             │
+│  - Initial state: PENDING                                                   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ Atomic CAS Claim (Lease Token)
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Background Dispatcher (NotificationDispatcher)              │
+│  - Periodic poll, bounded ThreadPoolTaskExecutor (pg-notify-)               │
+│  - Per-channel Token-Bucket Rate Limiter                                    │
+│  - State: PROCESSING (lease_expires_at)                                      │
+└──────────────────────┬──────────────────────────────┬───────────────────────┘
+                       │                              │
+                       ▼                              ▼
+      ┌────────────────────────────────┐  ┌──────────────────────────────────┐
+      │   WebhookNotificationChannel   │  │     SlackNotificationChannel     │
+      │ - Signed HMAC-SHA256 payload   │  │ - Slack Incoming Webhook         │
+      │ - Idempotency-Key header       │  │ - Escaped mrkdwn text & icons    │
+      └────────────────┬───────────────┘  └──────────────────┬───────────────┘
+                       │                                     │
+                       └──────────────────────┬──────────────┘
+                                              │ SSRF Defense & Pinned IP Connect
+                                              ▼
+                        ┌──────────────────────────────────────────┐
+                        │          SafeSocketHttpClient            │
+                        │ - DNS resolved once, all IPs validated   │
+                        │ - Blocks RFC1918, loopback, link-local   │
+                        │ - HTTPS enforcement & SNI verification   │
+                        │ - Redirects never followed               │
+                        └─────────────────────┬────────────────────┘
+                                              │
+                      ┌───────────────────────┴───────────────────────┐
+                      ▼                                               ▼
+         [ Success (2xx) ]                               [ Failure (4xx / 5xx / Network) ]
+                 │                                                    │
+                 ▼                                                    ▼
+    State: DELIVERED                                     Permanent? (4xx / Policy Violation)
+    Recorded in delivery_attempts                                     │
+                                                     ┌────────────────┴────────────────┐
+                                                     ▼                                 ▼
+                                                Yes: DEAD                    No: Retryable (5xx, 429)
+                                                                                       │
+                                                                           Attempt < Max Attempts?
+                                                                             ├── Yes: State PENDING
+                                                                             │   (Exponential Backoff + Jitter)
+                                                                             └── No: State DEAD
+```
+
+### 1. Delivery Guarantees & Transactional Outbox
+* **At-Least-Once Delivery**: To survive process crashes and network partitions, outbox records are enqueued inside the same database transaction as the incident state change.
+* **Lease-Based Worker Safety**: Workers claim batches using an atomic compare-and-set conditional update (`UPDATE notification_outbox SET status='PROCESSING', lease_token=?, lease_expires_at=? WHERE status='PENDING' OR (status='PROCESSING' AND lease_expires_at < now)`). If a worker crashes mid-delivery, the expired lease allows other workers to reclaim the item after `lease_duration`.
+* **Idempotency Keys**: Each outbox item carries a deterministic UUID `event_id` (`incident:{id}:OPENED`, `incident:{id}:RESOLVED`, `incident:{id}:OCCURRENCE:{count}`). Webhook receivers receive this in the `Idempotency-Key` header, allowing consumers to deduplicate redeliveries.
+* **No Real-Time Network I/O in Transactions**: The incident detection transaction only inserts database rows. Actual HTTP delivery occurs asynchronously in background dispatcher threads.
+
+### 2. Destination Security & SSRF Defense
+* **SafeSocketHttpClient**: Standard Java `HttpClient` re-resolves DNS at connect time, leaving a TOCTOU DNS-rebinding window. PulseGuard features a custom socket HTTP client that resolves DNS once, validates **every** resolved IP against blocked CIDR ranges, and connects directly to the validated IP while preserving TLS SNI and hostname verification.
+* **Blocked IP Ranges**:
+  - IPv4: Loopback (`127.0.0.0/8`), Private RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), Link-Local (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`), Multicast, Reserved (`240.0.0.0/4`), Broadcast (`255.255.255.255`), Documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), Benchmarking (`198.18.0.0/15`).
+  - IPv6: Loopback (`::1`), Link-Local (`fe80::/10`), ULA (`fc00::/7`), NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`), Teredo (`2001::/32`), Documentation (`2001:db8::/32`).
+* **Scheme & Host Protections**: Only `https` destinations are allowed by default (`http` is strictly blocked unless `pulseguard.notifications.security.allow-unsafe-destinations=true` in local development). User credentials in URLs are blocked.
+* **Slack Host Restriction**: The Slack channel requires destination hosts to match `hooks.slack.com` or `hooks.slack-gov.com`.
+* **No Redirects Followed**: HTTP 3xx responses are treated as permanent delivery failures rather than followed automatically.
+* **Secret Redaction**: URLs, Slack webhook tokens, HMAC secrets, Bearer tokens, and sensitive JDK network exception messages are scrubbed by `Redactor` prior to persistence or logging.
+
+### 3. Webhook Contract & Signature Verification
+HTTP POST headers sent to generic webhook endpoints:
+* `Content-Type: application/json; charset=utf-8`
+* `User-Agent: PulseGuard-Webhook/1`
+* `X-PulseGuard-Event: INCIDENT_OPENED | INCIDENT_OCCURRENCE | INCIDENT_RESOLVED`
+* `X-PulseGuard-Delivery: <delivery-uuid>`
+* `Idempotency-Key: <event-uuid>`
+* `X-PulseGuard-Timestamp: <unix-timestamp>`
+* `X-PulseGuard-Signature: sha256=<hex-hmac-sha256>`
+
+**Example Webhook Payload**:
+```json
+{
+  "schemaVersion": 1,
+  "eventId": "f5e9d997-c81f-3610-863a-bb09aa903020",
+  "deliveryId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "eventType": "INCIDENT_OPENED",
+  "occurredAt": "2026-10-10T12:00:00Z",
+  "service": {
+    "id": "e674a2d8-2b81-4fe6-a947-f7cb12999e5a",
+    "name": "Payments API"
+  },
+  "incident": {
+    "id": "bb912803-b097-4022-9442-8809489aa455",
+    "type": "SERVICE_UNAVAILABLE",
+    "severity": "CRITICAL",
+    "status": "OPEN",
+    "summary": "Service 'Payments API' unavailable: 3 consecutive health check failures",
+    "details": "Connection timed out after 3000ms",
+    "startedAt": "2026-10-10T11:58:30Z",
+    "lastOccurrenceAt": "2026-10-10T12:00:00Z",
+    "resolvedAt": null,
+    "occurrenceCount": 3
+  }
+}
+```
+
+**Verifying the HMAC Signature (Java snippet)**:
+```java
+Mac mac = Mac.getInstance("HmacSHA256");
+mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+mac.update(timestamp.getBytes(StandardCharsets.UTF_8));
+mac.update((byte) '.');
+String expected = "sha256=" + HexFormat.of().formatHex(mac.doFinal(bodyBytes));
+boolean valid = MessageDigest.isEqual(expected.getBytes(), signatureHeader.getBytes());
+```
+
+---
+
+## Database Schema
+
+Database migrations are managed via version-controlled Flyway scripts:
+
+### Phase 1 — Monitored Services (`V1__create_services_table.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS services (
+    id UUID PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    description VARCHAR(500),
+    url VARCHAR(2048) NOT NULL,
+    check_interval_seconds INTEGER NOT NULL,
+    timeout_ms INTEGER NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Phase 2 — Health Checks (`V2__create_health_checks_table.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS health_checks (
+    id UUID PRIMARY KEY,
+    service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    checked_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    result VARCHAR(30) NOT NULL,
+    http_status_code INTEGER,
+    response_time_ms BIGINT NOT NULL,
+    error_message VARCHAR(1000),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Phase 3 & 4 — Incidents (`V3__create_incidents_table.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS incidents (
+    id UUID PRIMARY KEY,
+    service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+    incident_type VARCHAR(50) NOT NULL,
+    severity VARCHAR(30) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    summary VARCHAR(255) NOT NULL,
+    details VARCHAR(2000),
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_occurrence_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    occurrence_count BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Phase 5 — Notification Outbox (`V4__create_notification_outbox.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id UUID PRIMARY KEY,
+    event_id UUID NOT NULL,
+    channel VARCHAR(30) NOT NULL,
+    event_type VARCHAR(40) NOT NULL,
+    incident_id UUID NOT NULL,
+    service_id UUID NOT NULL,
+    payload VARCHAR(4000) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    lease_token VARCHAR(64),
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    last_error VARCHAR(1000),
+    last_http_status INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT uk_notification_outbox_event_channel UNIQUE (event_id, channel)
+);
+
+CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+    id UUID PRIMARY KEY,
+    outbox_id UUID NOT NULL REFERENCES notification_outbox(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    attempted_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    outcome VARCHAR(30) NOT NULL,
+    http_status INTEGER,
+    error_message VARCHAR(1000),
+    CONSTRAINT uk_notification_attempts_outbox_number UNIQUE (outbox_id, attempt_number)
+);
+```
+
+---
+
+## Notification Management API
+
+### List Outbox Notifications
+`GET /api/v1/notifications?status=DELIVERED&channel=WEBHOOK&page=0&size=20`
+
+Response:
+```json
+{
+  "content": [
+    {
+      "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "eventId": "f5e9d997-c81f-3610-863a-bb09aa903020",
+      "channel": "WEBHOOK",
+      "eventType": "INCIDENT_OPENED",
+      "incidentId": "bb912803-b097-4022-9442-8809489aa455",
+      "serviceId": "e674a2d8-2b81-4fe6-a947-f7cb12999e5a",
+      "status": "DELIVERED",
+      "attemptCount": 1,
+      "nextAttemptAt": "2026-10-10T12:00:00Z",
+      "lastError": null,
+      "lastHttpStatus": 200,
+      "createdAt": "2026-10-10T12:00:00Z",
+      "updatedAt": "2026-10-10T12:00:01Z",
+      "deliveredAt": "2026-10-10T12:00:01Z"
+    }
+  ],
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
+
+### Inspect Notification Detail & Delivery Attempts
+`GET /api/v1/notifications/{id}`
+
+Response:
+```json
+{
+  "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "eventId": "f5e9d997-c81f-3610-863a-bb09aa903020",
+  "channel": "WEBHOOK",
+  "eventType": "INCIDENT_OPENED",
+  "incidentId": "bb912803-b097-4022-9442-8809489aa455",
+  "serviceId": "e674a2d8-2b81-4fe6-a947-f7cb12999e5a",
+  "status": "DELIVERED",
+  "attemptCount": 1,
+  "nextAttemptAt": "2026-10-10T12:00:00Z",
+  "lastError": null,
+  "lastHttpStatus": 200,
+  "createdAt": "2026-10-10T12:00:00Z",
+  "updatedAt": "2026-10-10T12:00:01Z",
+  "deliveredAt": "2026-10-10T12:00:01Z",
+  "attempts": [
+    {
+      "id": "99277dca-7182-4422-91f1-3fcf7b1933a2",
+      "attemptNumber": 1,
+      "attemptedAt": "2026-10-10T12:00:00.500Z",
+      "durationMs": 142,
+      "outcome": "SUCCESS",
+      "httpStatus": 200,
+      "errorMessage": null
+    }
+  ]
+}
+```
+
+---
+
 ## Known Limitations
 
-- **Email / Webhook Alerting**: Automated incident creation and resolution are currently surfaced via database records, REST APIs, structured logs, and Micrometer metrics. Dedicated alert dispatchers (Slack, PagerDuty, Webhooks, Email) are scheduled for Phase 5.
-- **Statistical Anomaly Detection**: Incident creation in Phase 4 is based on deterministic consecutive-failure and error thresholds. Trend-based latency anomalies and dynamic thresholding belong to Phase 5.
+- **At-Least-Once Delivery & Duplicate Window**: If a destination accepts an alert but the connection terminates before the HTTP response code is read by PulseGuard, or if a slow delivery worker exceeds its lease duration, PulseGuard may redeliver the event. Consumers should use `Idempotency-Key` or `eventId` to achieve idempotency. Note that Slack Incoming Webhooks do not natively support idempotency keys.
+- **In-Memory Rate Limiting**: The token-bucket rate limiter runs in-memory per application instance. Across N horizontal instances, total dispatch rate is bounded by N times the configured per-instance limit.
+- **SSRF Restrictions on Health Prober**: While outbound notification webhooks are strictly guarded by `SafeSocketHttpClient` and SSRF CIDR policies, the monitored service health checker (`JavaHttpHealthProber`) currently probes arbitrary user-registered URLs without private-network restrictions to allow internal intranet monitoring.
+- **No Native Email or PagerDuty**: Email (SMTP/SES) and PagerDuty (Events API v2) can be cleanly plugged in via the `NotificationChannel` interface, but are not bundled by default to avoid heavy third-party SDK dependencies.
 
 ---
 
@@ -592,5 +878,6 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 * **Phase 2 (Completed)**: Health Check Execution Engine with standard Java 21 `HttpClient`, latency measurement, status code capturing, manual check trigger (`POST /api/v1/services/{id}/checks`), historical checks pagination (`GET /api/v1/services/{id}/checks`), and Flyway `V2` migration.
 * **Phase 3 (Completed)**: Automated background scheduling engine with bounded `ThreadPoolTaskExecutor`, independent per-service check intervals, same-service overlap protection, failure isolation, graceful shutdown, and scheduler Micrometer metrics.
 * **Phase 4 (Completed)**: Incident Detection & Recovery Engine, deterministic consecutive-failure thresholds, automated recovery resolution, occurrence counters, pessimistic row locking and database partial unique constraint against concurrent duplicate incidents, incident history & filtering REST APIs (`/api/v1/incidents`), and Micrometer observability.
-* **Phase 5**: Anomaly detection algorithms, alerting channels (Slack, Webhooks, Email), and observability dashboards.
+* **Phase 5 (Completed)**: Alerting & Notification Dispatcher Engine, Transactional Outbox pattern, lease-based concurrent claiming, bounded exponential backoff with jitter, SSRF and DNS-rebinding defense via pinned-IP socket client, Generic Signed Webhook channel, Slack channel, token-bucket rate limiting, management audit APIs (`/api/v1/notifications`), and Micrometer observability.
+* **Phase 6 (Proposed)**: Statistical Anomaly & Latency Drift Detection — dynamic percentile-based latency thresholds ($p95$, $p99$), moving-average error rate spike detection, automated incident severity escalation (WARNING -> CRITICAL), and authenticated notification administration.
 

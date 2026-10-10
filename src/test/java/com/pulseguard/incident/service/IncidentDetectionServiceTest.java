@@ -40,6 +40,9 @@ class IncidentDetectionServiceTest {
     @Mock
     private HealthCheckRepository healthCheckRepository;
 
+    @Mock
+    private com.pulseguard.notification.service.NotificationEnqueuer notificationEnqueuer;
+
     private IncidentProperties incidentProperties;
     private IncidentMetrics incidentMetrics;
     private IncidentDetectionService detectionService;
@@ -59,7 +62,8 @@ class IncidentDetectionServiceTest {
                 incidentRepository,
                 healthCheckRepository,
                 incidentProperties,
-                incidentMetrics
+                incidentMetrics,
+                notificationEnqueuer
         );
 
         service = new MonitoredService("Orders API", "Processing", "https://orders.com", 30, 3000);

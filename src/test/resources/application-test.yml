@@ -36,4 +36,11 @@ pulseguard:
     max-concurrent-checks: 5
     queue-capacity: 20
     termination-timeout-seconds: 5
+  notifications:
+    dispatcher:
+      enabled: false
+      poll-interval-ms: 60000
+      initial-delay-ms: 60000
+    security:
+      allow-unsafe-destinations: true
 

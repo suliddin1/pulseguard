@@ -10,6 +10,8 @@ import com.pulseguard.incident.model.IncidentStatus;
 import com.pulseguard.incident.model.IncidentType;
 import com.pulseguard.incident.repository.IncidentRepository;
 import com.pulseguard.service.model.MonitoredService;
+import com.pulseguard.notification.service.NotificationEnqueueException;
+import com.pulseguard.notification.service.NotificationEnqueuer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -31,17 +33,20 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
     private final HealthCheckRepository healthCheckRepository;
     private final IncidentProperties incidentProperties;
     private final IncidentMetrics incidentMetrics;
+    private final NotificationEnqueuer notificationEnqueuer;
 
     public IncidentDetectionServiceImpl(
             IncidentRepository incidentRepository,
             HealthCheckRepository healthCheckRepository,
             IncidentProperties incidentProperties,
-            IncidentMetrics incidentMetrics
+            IncidentMetrics incidentMetrics,
+            NotificationEnqueuer notificationEnqueuer
     ) {
         this.incidentRepository = incidentRepository;
         this.healthCheckRepository = healthCheckRepository;
         this.incidentProperties = incidentProperties;
         this.incidentMetrics = incidentMetrics;
+        this.notificationEnqueuer = notificationEnqueuer;
     }
 
     @Override
@@ -56,6 +61,11 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             } else {
                 evaluateFailure(service, healthCheck);
             }
+        } catch (NotificationEnqueueException ex) {
+            incidentMetrics.recordProcessingFailure();
+            log.error("Failed to enqueue notification for service '{}' (ID: {}): {}",
+                    service.getName(), service.getId(), ex.getMessage(), ex);
+            throw ex;
         } catch (Exception ex) {
             incidentMetrics.recordProcessingFailure();
             log.error("Failed to process incident evaluation for service '{}' (ID: {}): {}",
@@ -92,6 +102,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             openIncident.recordOccurrence(healthCheck.getCheckedAt(), healthCheck.getErrorMessage());
             incidentRepository.save(openIncident);
             incidentMetrics.recordOccurrence();
+            notificationEnqueuer.incidentOccurrence(openIncident);
             log.info("Recorded incident occurrence for service '{}' (Incident ID: {}). Count: {}",
                     service.getName(), openIncident.getId(), openIncident.getOccurrenceCount());
         } else if (consecutiveFailures >= threshold) {
@@ -118,6 +129,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             try {
                 Incident saved = incidentRepository.save(newIncident);
                 incidentMetrics.recordCreated();
+                notificationEnqueuer.incidentOpened(saved);
                 log.warn("Created new incident for service '{}' (Incident ID: {}): severity={}, summary='{}'",
                         service.getName(), saved.getId(), saved.getSeverity(), saved.getSummary());
             } catch (DataIntegrityViolationException ex) {
@@ -129,6 +141,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
                     existing.recordOccurrence(healthCheck.getCheckedAt(), healthCheck.getErrorMessage());
                     incidentRepository.save(existing);
                     incidentMetrics.recordOccurrence();
+                    notificationEnqueuer.incidentOccurrence(existing);
                 });
             }
         }
@@ -172,6 +185,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             openIncident.resolve(healthCheck.getCheckedAt(), resolutionDetails);
             incidentRepository.save(openIncident);
             incidentMetrics.recordResolved();
+            notificationEnqueuer.incidentResolved(openIncident);
 
             log.info("Resolved incident for service '{}' (Incident ID: {}). Resolved at: {}",
                     service.getName(), openIncident.getId(), openIncident.getResolvedAt());
