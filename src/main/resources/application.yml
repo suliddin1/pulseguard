@@ -30,7 +30,7 @@ spring:
 
   flyway:
     enabled: true
-    locations: classpath:db/migration
+    locations: classpath:db/migration,classpath:db/migration-postgresql
     baseline-on-migrate: true
     validate-on-migrate: true
 
@@ -57,4 +57,8 @@ pulseguard:
     max-concurrent-checks: ${PULSEGUARD_MAX_CONCURRENT_CHECKS:10}
     queue-capacity: ${PULSEGUARD_SCHEDULER_QUEUE_CAPACITY:100}
     termination-timeout-seconds: ${PULSEGUARD_SCHEDULER_TERMINATION_TIMEOUT_SECONDS:30}
+  incident:
+    consecutive-failures-threshold: ${PULSEGUARD_INCIDENT_FAILURES_THRESHOLD:3}
+    consecutive-successes-threshold: ${PULSEGUARD_INCIDENT_SUCCESSES_THRESHOLD:1}
+    initial-severity: ${PULSEGUARD_INCIDENT_INITIAL_SEVERITY:CRITICAL}
 

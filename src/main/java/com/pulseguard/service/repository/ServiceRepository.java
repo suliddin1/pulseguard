@@ -27,4 +27,8 @@ public interface ServiceRepository extends JpaRepository<MonitoredService, UUID>
     Page<MonitoredService> findByEnabledAndStatus(boolean enabled, ServiceStatus status, Pageable pageable);
 
     List<MonitoredService> findByEnabledTrue();
+
+    @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)
+    @org.springframework.data.jpa.repository.Query("SELECT s FROM MonitoredService s WHERE s.id = :id")
+    Optional<MonitoredService> findWithLockById(@org.springframework.data.repository.query.Param("id") UUID id);
 }

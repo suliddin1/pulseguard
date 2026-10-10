@@ -30,15 +30,27 @@ public class HealthCheckExecutionServiceImpl implements HealthCheckExecutionServ
     private final ServiceRepository serviceRepository;
     private final HealthCheckRepository healthCheckRepository;
     private final HttpHealthProber httpHealthProber;
+    private final com.pulseguard.incident.service.IncidentDetectionService incidentDetectionService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public HealthCheckExecutionServiceImpl(
+            ServiceRepository serviceRepository,
+            HealthCheckRepository healthCheckRepository,
+            HttpHealthProber httpHealthProber,
+            com.pulseguard.incident.service.IncidentDetectionService incidentDetectionService
+    ) {
+        this.serviceRepository = serviceRepository;
+        this.healthCheckRepository = healthCheckRepository;
+        this.httpHealthProber = httpHealthProber;
+        this.incidentDetectionService = incidentDetectionService;
+    }
 
     public HealthCheckExecutionServiceImpl(
             ServiceRepository serviceRepository,
             HealthCheckRepository healthCheckRepository,
             HttpHealthProber httpHealthProber
     ) {
-        this.serviceRepository = serviceRepository;
-        this.healthCheckRepository = healthCheckRepository;
-        this.httpHealthProber = httpHealthProber;
+        this(serviceRepository, healthCheckRepository, httpHealthProber, null);
     }
 
     @Override
@@ -46,7 +58,8 @@ public class HealthCheckExecutionServiceImpl implements HealthCheckExecutionServ
     public HealthCheckResponse executeHealthCheck(UUID serviceId) {
         log.info("Executing health check for service ID '{}'", serviceId);
 
-        MonitoredService service = serviceRepository.findById(serviceId)
+        MonitoredService service = serviceRepository.findWithLockById(serviceId)
+                .or(() -> serviceRepository.findById(serviceId))
                 .orElseThrow(() -> new ResourceNotFoundException("Service", serviceId));
 
         if (!service.isEnabled()) {
@@ -68,6 +81,12 @@ public class HealthCheckExecutionServiceImpl implements HealthCheckExecutionServ
         service.recordHealthCheckOutcome(probeResult.result());
 
         HealthCheck savedCheck = healthCheckRepository.save(healthCheck);
+
+        // Automatically evaluate incident detection and recovery rules
+        if (incidentDetectionService != null) {
+            incidentDetectionService.evaluateCheck(service, savedCheck);
+        }
+
         log.info("Health check completed for service '{}' with result: {}, latency: {}ms, new status: {}",
                 service.getName(), probeResult.result(), probeResult.responseTimeMs(), service.getStatus());
 

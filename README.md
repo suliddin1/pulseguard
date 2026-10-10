@@ -135,6 +135,41 @@ CREATE INDEX idx_health_checks_service_checked_at ON health_checks(service_id, c
 CREATE INDEX idx_health_checks_result ON health_checks(result);
 ```
 
+### Phase 4 — Incidents (`V3__create_incidents_table.sql` & `V3_1__create_unique_open_incident_index.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS incidents (
+    id UUID PRIMARY KEY,
+    service_id UUID NOT NULL,
+    incident_type VARCHAR(50) NOT NULL,
+    severity VARCHAR(30) NOT NULL,
+    status VARCHAR(30) NOT NULL,
+    summary VARCHAR(255) NOT NULL,
+    details VARCHAR(2000),
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_occurrence_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    resolved_at TIMESTAMP WITH TIME ZONE,
+    occurrence_count BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_incidents_service FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+    CONSTRAINT chk_incidents_occurrence_count CHECK (occurrence_count >= 1),
+    CONSTRAINT chk_incidents_status CHECK (status IN ('OPEN', 'RESOLVED')),
+    CONSTRAINT chk_incidents_severity CHECK (severity IN ('WARNING', 'CRITICAL')),
+    CONSTRAINT chk_incidents_type CHECK (incident_type IN ('SERVICE_UNAVAILABLE', 'HIGH_LATENCY', 'HIGH_ERROR_RATE'))
+);
+
+CREATE INDEX idx_incidents_service_id ON incidents(service_id);
+CREATE INDEX idx_incidents_status ON incidents(status);
+CREATE INDEX idx_incidents_severity ON incidents(severity);
+CREATE INDEX idx_incidents_type ON incidents(incident_type);
+CREATE INDEX idx_incidents_started_at ON incidents(started_at DESC);
+CREATE INDEX idx_incidents_service_status ON incidents(service_id, status);
+CREATE INDEX idx_incidents_service_started_at ON incidents(service_id, started_at DESC);
+
+-- PostgreSQL partial unique index ensuring single active incident per service & type
+CREATE UNIQUE INDEX uk_incidents_service_type_open ON incidents(service_id, incident_type) WHERE status = 'OPEN';
+```
+
 ---
 
 ## Health Check Engine
@@ -221,6 +256,60 @@ PulseGuard features an automated background scheduling subsystem that executes p
 | `pulseguard.scheduler.max-concurrent-checks` | `10` | Maximum worker threads in the health check thread pool |
 | `pulseguard.scheduler.queue-capacity` | `50` | Maximum queue size for pending health check tasks |
 | `pulseguard.scheduler.termination-timeout-seconds` | `30` | Maximum grace period for in-flight tasks during shutdown |
+
+---
+
+## Incident Detection & Recovery Engine
+
+PulseGuard features an automated Incident Detection & Recovery Engine that continuously evaluates real health-check probe results (from both manual requests and automated scheduler polling cycles), tracks incident lifecycles, and detects recovery:
+
+```
+       Consecutive Failures >= Threshold (default: 3)
+   [HEALTHY] ───────────────────────────────────────────► [OPEN Incident]
+      ▲                                                         │
+      │                                                         │ Subsequent Failures
+      │                                                         ▼
+      │                                                 [Occurrence Update]
+      │                                                 (Increments count,
+      │                                                  updates lastOccurrenceAt)
+      │                                                         │
+      │         Consecutive Successes >= Threshold (default: 1) │
+      └─────────────────────────────────────────────────────────┘
+                            [RESOLVED Incident]
+                   (Sets resolvedAt, details, preserves history)
+```
+
+### 1. Incident Lifecycle & Transition Rules
+
+- **Detection Threshold**: An incident of type `SERVICE_UNAVAILABLE` with severity `CRITICAL` is generated only when a service experiences `N` consecutive failures (configurable via `pulseguard.incident.consecutive-failures-threshold`, default `3`). Isolated intermittent failures do not generate false-positive alarms.
+- **Occurrence Updating**: When a service with an already `OPEN` incident continues to fail, the engine records an occurrence update—incrementing `occurrenceCount` and advancing `lastOccurrenceAt`—instead of generating duplicate incidents.
+- **Streak Resetting**: A successful check resets the consecutive-failure counter. For example, 2 failures followed by 1 success and 1 failure results in a failure count of 1.
+- **Automated Recovery**: When an open incident exists and the service achieves `M` consecutive successful checks (configurable via `pulseguard.incident.consecutive-successes-threshold`, default `1`), the incident transitions to `RESOLVED` status, timestamps `resolvedAt`, and records resolution details. Subsequent successful checks do not trigger duplicate resolutions.
+- **Preserved History**: Resolved incidents remain permanently persisted and queryable for retrospective SLA tracking.
+
+### 2. Concurrency & Duplicate Prevention
+
+To ensure database correctness in multi-threaded and distributed environments:
+1. **Row-Level Pessimistic Locking**: `HealthCheckExecutionServiceImpl` acquires a pessimistic write lock (`SELECT ... FOR UPDATE`) on the monitored service row before recording health checks and evaluating incident rules. All checks for the same service execute sequentially with transactional isolation, guaranteeing atomic failure counts and preventing race conditions.
+2. **PostgreSQL Partial Unique Constraint**: The database schema enforces `CREATE UNIQUE INDEX uk_incidents_service_type_open ON incidents(service_id, incident_type) WHERE status = 'OPEN'`. If concurrent requests ever bypassed application synchronization, PostgreSQL rejects duplicate open incidents.
+3. **Graceful Fallback**: If a duplicate key violation is encountered during an insert race, the transaction safely catches the violation and falls back to recording an occurrence on the existing incident.
+
+### 3. Incident Configuration Properties
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `pulseguard.incident.consecutive-failures-threshold` | `3` | Consecutive failures required before opening an incident |
+| `pulseguard.incident.consecutive-successes-threshold` | `1` | Consecutive successful checks required to resolve an open incident |
+| `pulseguard.incident.initial-severity` | `CRITICAL` | Initial severity assigned to confirmed service outages (`WARNING`, `CRITICAL`) |
+
+### 4. Metrics & Observability
+
+Thread-safe counters and Micrometer metrics track incident activity:
+- `pulseguard.incidents.created`: Total number of incidents created
+- `pulseguard.incidents.resolved`: Total number of incidents resolved
+- `pulseguard.incidents.occurrences`: Total number of incident occurrences updated
+- `pulseguard.incidents.failures`: Total count of incident evaluation processing failures
+- `pulseguard.incidents.open`: Gauge tracking current number of open incidents
 
 ---
 
@@ -344,6 +433,70 @@ PulseGuard features an automated background scheduling subsystem that executes p
 
 ---
 
+### Incident Management (`/api/v1/incidents`)
+
+#### 9. Retrieve Service Incident History
+* **Endpoint**: `GET /api/v1/services/{serviceId}/incidents`
+* **Query Parameters**:
+  * `page` (optional, int, default `0`): Page index
+  * `size` (optional, int, default `20`, max `100`): Page size
+  * `sort` (optional, string, default `startedAt,desc`): Sort order
+* **Status**: `200 OK`
+
+#### 10. List Global Incidents with Filters
+* **Endpoint**: `GET /api/v1/incidents`
+* **Query Parameters**:
+  * `serviceId` (optional, UUID): Filter by service ID
+  * `status` (optional, string): Filter by status (`OPEN`, `RESOLVED`)
+  * `severity` (optional, string): Filter by severity (`WARNING`, `CRITICAL`)
+  * `type` (optional, string): Filter by type (`SERVICE_UNAVAILABLE`, `HIGH_LATENCY`, `HIGH_ERROR_RATE`)
+  * `from` (optional, ISO-8601 timestamp): Filter incidents started after this timestamp
+  * `to` (optional, ISO-8601 timestamp): Filter incidents started before this timestamp
+  * `page` (optional, int, default `0`): Page index
+  * `size` (optional, int, default `20`, max `100`): Page size
+  * `sort` (optional, string, default `startedAt,desc`): Sort order
+* **Status**: `200 OK`
+
+**Response Body**:
+```json
+{
+  "content": [
+    {
+      "id": "e6fbbd42-2d93-4a18-80f0-c5a5e3052140",
+      "serviceId": "c56a4180-65aa-42ec-a945-5fd21dec0538",
+      "serviceName": "Payment Gateway API",
+      "incidentType": "SERVICE_UNAVAILABLE",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "summary": "Service 'Payment Gateway API' unavailable: 3 consecutive health check failures",
+      "details": "Connection refused to upstream host",
+      "startedAt": "2026-10-10T14:20:00Z",
+      "lastOccurrenceAt": "2026-10-10T14:21:30Z",
+      "resolvedAt": null,
+      "occurrenceCount": 4,
+      "createdAt": "2026-10-10T14:21:00Z",
+      "updatedAt": "2026-10-10T14:21:30Z"
+    }
+  ],
+  "pageable": {
+    "pageNumber": 0,
+    "pageSize": 20
+  },
+  "totalElements": 1,
+  "totalPages": 1
+}
+```
+
+#### 11. List Active / Open Incidents
+* **Endpoint**: `GET /api/v1/incidents/open`
+* **Status**: `200 OK`
+
+#### 12. Get Incident by ID
+* **Endpoint**: `GET /api/v1/incidents/{id}`
+* **Status**: `200 OK` (or `404 Not Found`)
+
+---
+
 ## Error Handling
 
 All error responses adhere to a consistent structure:
@@ -413,14 +566,23 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 .\mvnw.cmd test
 ```
 
-* **Domain Unit Tests** (`MonitoredServiceTest`, `HealthCheckTest`): Validates entity lifecycle, state mutations, clamping, and invariant enforcement.
+* **Domain Unit Tests** (`MonitoredServiceTest`, `HealthCheckTest`, `IncidentTest`): Validates entity lifecycle, state mutations, clamping, and invariant enforcement.
 * **Prober Unit Tests** (`JavaHttpHealthProberTest`): Validates HTTP probing, latency measurement, timeout handling, and connection error handling using an embedded JDK `HttpServer`.
 * **Scheduler Unit Tests** (`DueCheckEvaluatorTest`, `HealthCheckSchedulerTest`): Validates dynamic due evaluation across unverified/verified services, time interval boundaries, overlap protection, and executor capacity rejection.
 * **Scheduler Concurrency & Lifecycle Tests** (`SchedulerConcurrencyTest`, `SchedulerLifecycleIntegrationTest`): Tests parallel multi-service execution, slow-service non-blocking guarantees via synchronization latches, and Spring Boot application lifecycle startup/shutdown.
+* **Incident Detection & Recovery Tests** (`IncidentDetectionServiceTest`): Tests threshold-based incident creation, occurrence counter updates on repeated failures, streak resets on intermediate successes, automatic recovery resolution, and exception isolation.
+* **Incident Concurrency & Lifecycle Tests** (`IncidentConcurrencyTest`, `IncidentLifecycleIntegrationTest`): Tests concurrent health checks preventing duplicate open incidents via pessimistic locking and database constraints, and end-to-end failure -> incident -> recovery -> API query.
 * **Service Layer Unit Tests** (`ServiceManagementServiceTest`, `HealthCheckExecutionServiceTest`): Tests business logic, unique constraints, health check execution, and repository interactions using Mockito.
-* **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`): Validates HTTP contract, Bean Validation rules, JSON serialization, and error mapping using `MockMvc`.
-* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1` and `V2`), historical ordering, group aggregation queries, and cascade deletes with `@DataJpaTest`.
+* **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`, `IncidentControllerTest`): Validates HTTP contracts, Bean Validation rules, query filters, JSON serialization, and RFC 7807 error mappings using `MockMvc`.
+* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`, `IncidentRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1`, `V2`, `V3`), historical ordering, dynamic criteria specifications, group aggregation queries, and cascade deletes with `@DataJpaTest`.
 * **PostgreSQL Testcontainers** (`PulseGuardPostgresTestcontainersIntegrationTest`): Runs end-to-end against real PostgreSQL when a Docker daemon is available.
+
+---
+
+## Known Limitations
+
+- **Email / Webhook Alerting**: Automated incident creation and resolution are currently surfaced via database records, REST APIs, structured logs, and Micrometer metrics. Dedicated alert dispatchers (Slack, PagerDuty, Webhooks, Email) are scheduled for Phase 5.
+- **Statistical Anomaly Detection**: Incident creation in Phase 4 is based on deterministic consecutive-failure and error thresholds. Trend-based latency anomalies and dynamic thresholding belong to Phase 5.
 
 ---
 
@@ -429,5 +591,6 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 * **Phase 1 (Completed)**: Core service registry foundation, PostgreSQL + Flyway persistence, layered architecture, DTO isolation, Bean Validation, Global Exception Handling, and comprehensive test suite.
 * **Phase 2 (Completed)**: Health Check Execution Engine with standard Java 21 `HttpClient`, latency measurement, status code capturing, manual check trigger (`POST /api/v1/services/{id}/checks`), historical checks pagination (`GET /api/v1/services/{id}/checks`), and Flyway `V2` migration.
 * **Phase 3 (Completed)**: Automated background scheduling engine with bounded `ThreadPoolTaskExecutor`, independent per-service check intervals, same-service overlap protection, failure isolation, graceful shutdown, and scheduler Micrometer metrics.
-* **Phase 4**: Incident generation & recovery engine, incident lifecycle (`/api/v1/services/{id}/incidents`), anomaly detection algorithms, and alerting channels (Slack, Webhooks, Email).
+* **Phase 4 (Completed)**: Incident Detection & Recovery Engine, deterministic consecutive-failure thresholds, automated recovery resolution, occurrence counters, pessimistic row locking and database partial unique constraint against concurrent duplicate incidents, incident history & filtering REST APIs (`/api/v1/incidents`), and Micrometer observability.
+* **Phase 5**: Anomaly detection algorithms, alerting channels (Slack, Webhooks, Email), and observability dashboards.
 

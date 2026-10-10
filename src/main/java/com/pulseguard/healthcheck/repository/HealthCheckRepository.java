@@ -40,6 +40,8 @@ public interface HealthCheckRepository extends JpaRepository<HealthCheck, UUID> 
 
     Optional<HealthCheck> findTopByServiceIdOrderByCheckedAtDesc(UUID serviceId);
 
+    List<HealthCheck> findTop10ByServiceIdOrderByCheckedAtDesc(UUID serviceId);
+
     @Query("SELECT h.service.id, MAX(h.checkedAt) FROM HealthCheck h GROUP BY h.service.id")
     List<Object[]> findLatestCheckTimesGroupedByService();
 }
