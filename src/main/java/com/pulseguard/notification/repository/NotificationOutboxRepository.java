@@ -28,6 +28,8 @@ public interface NotificationOutboxRepository
 
     boolean existsByIncidentIdAndEventTypeAndCreatedAtAfter(UUID incidentId, NotificationEventType eventType, Instant after);
 
+    List<NotificationOutbox> findByIncidentIdOrderByCreatedAtAsc(UUID incidentId);
+
     long countByStatus(OutboxStatus status);
 
     /** Ids of rows that are due (PENDING) or abandoned (PROCESSING with an expired lease), oldest first. */

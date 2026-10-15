@@ -109,5 +109,10 @@ class SlackNotificationChannelTest {
         incident.resolve(Instant.now(), "Fixed");
         NotificationPayload resolved = NotificationPayload.of(UUID.randomUUID(), NotificationEventType.INCIDENT_RESOLVED, Instant.now(), incident);
         assertThat(SlackNotificationChannel.renderText(resolved)).contains(":white_check_mark:").contains("Incident resolved");
+
+        Incident escalatedIncident = new Incident(service, IncidentType.HIGH_LATENCY, IncidentSeverity.WARNING, "Latency high", "Details", Instant.now());
+        escalatedIncident.escalate(IncidentSeverity.CRITICAL, Instant.now(), "Escalated");
+        NotificationPayload escalated = NotificationPayload.of(UUID.randomUUID(), NotificationEventType.INCIDENT_ESCALATED, Instant.now(), escalatedIncident);
+        assertThat(SlackNotificationChannel.renderText(escalated)).contains(":arrow_double_up:").contains("Incident escalated");
     }
 }

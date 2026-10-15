@@ -15,4 +15,6 @@ public interface NotificationEnqueuer {
     void incidentOccurrence(Incident incident);
 
     void incidentResolved(Incident incident);
+
+    void incidentEscalated(Incident incident);
 }

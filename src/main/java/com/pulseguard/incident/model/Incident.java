@@ -118,6 +118,22 @@ public class Incident {
         this.updatedAt = Instant.now();
     }
 
+    public void escalate(IncidentSeverity newSeverity, Instant escalationTime, String escalationDetails) {
+        if (this.status != IncidentStatus.OPEN) {
+            throw new IllegalStateException("Cannot escalate a non-open incident");
+        }
+        Objects.requireNonNull(newSeverity, "New severity must not be null");
+        // Monotonic severity: cannot downgrade (e.g. CRITICAL -> WARNING)
+        if (this.severity == IncidentSeverity.CRITICAL && newSeverity == IncidentSeverity.WARNING) {
+            return;
+        }
+        this.severity = newSeverity;
+        this.updatedAt = escalationTime != null ? escalationTime : Instant.now();
+        if (escalationDetails != null) {
+            this.details = truncate(escalationDetails, MAX_DETAILS_LENGTH);
+        }
+    }
+
     public boolean isOpen() {
         return this.status == IncidentStatus.OPEN;
     }

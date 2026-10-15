@@ -170,6 +170,64 @@ CREATE INDEX idx_incidents_service_started_at ON incidents(service_id, started_a
 CREATE UNIQUE INDEX uk_incidents_service_type_open ON incidents(service_id, incident_type) WHERE status = 'OPEN';
 ```
 
+### Phase 5 — Notification Outbox (`V4__create_notification_outbox.sql`)
+```sql
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id UUID PRIMARY KEY,
+    event_id UUID NOT NULL,
+    channel VARCHAR(30) NOT NULL,
+    event_type VARCHAR(40) NOT NULL,
+    incident_id UUID NOT NULL,
+    service_id UUID NOT NULL,
+    payload VARCHAR(4000) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    lease_token VARCHAR(64),
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    last_error VARCHAR(1000),
+    last_http_status INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT uk_notification_outbox_event_channel UNIQUE (event_id, channel),
+    CONSTRAINT chk_notification_outbox_status CHECK (status IN ('PENDING', 'PROCESSING', 'DELIVERED', 'DEAD')),
+    CONSTRAINT chk_notification_outbox_attempts CHECK (attempt_count >= 0),
+    CONSTRAINT chk_notification_outbox_channel CHECK (channel IN ('WEBHOOK', 'SLACK')),
+    CONSTRAINT chk_notification_outbox_event_type CHECK (event_type IN ('INCIDENT_OPENED', 'INCIDENT_OCCURRENCE', 'INCIDENT_RESOLVED'))
+);
+
+CREATE INDEX idx_notification_outbox_due ON notification_outbox(status, next_attempt_at);
+CREATE INDEX idx_notification_outbox_lease ON notification_outbox(status, lease_expires_at);
+CREATE INDEX idx_notification_outbox_incident ON notification_outbox(incident_id, event_type, created_at);
+CREATE INDEX idx_notification_outbox_created_at ON notification_outbox(created_at);
+
+CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+    id UUID PRIMARY KEY,
+    outbox_id UUID NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    attempted_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    outcome VARCHAR(30) NOT NULL,
+    http_status INTEGER,
+    error_message VARCHAR(1000),
+    CONSTRAINT fk_notification_attempts_outbox FOREIGN KEY (outbox_id) REFERENCES notification_outbox(id) ON DELETE CASCADE,
+    CONSTRAINT uk_notification_attempts_outbox_number UNIQUE (outbox_id, attempt_number),
+    CONSTRAINT chk_notification_attempts_outcome CHECK (outcome IN ('SUCCESS', 'RETRYABLE_FAILURE', 'PERMANENT_FAILURE')),
+    CONSTRAINT chk_notification_attempts_duration CHECK (duration_ms >= 0)
+);
+
+CREATE INDEX idx_notification_attempts_outbox ON notification_delivery_attempts(outbox_id, attempt_number);
+```
+
+### Phase 6 — Outbox Constraint Evolution (`V5__add_escalation_event_type.sql`)
+```sql
+ALTER TABLE notification_outbox DROP CONSTRAINT chk_notification_outbox_event_type;
+
+ALTER TABLE notification_outbox ADD CONSTRAINT chk_notification_outbox_event_type
+    CHECK (event_type IN ('INCIDENT_OPENED', 'INCIDENT_OCCURRENCE', 'INCIDENT_RESOLVED', 'INCIDENT_ESCALATED'));
+```
+
 ---
 
 ## Health Check Engine
@@ -572,9 +630,11 @@ PulseGuard features a multi-tiered test suite covering unit, slice, and integrat
 * **Scheduler Concurrency & Lifecycle Tests** (`SchedulerConcurrencyTest`, `SchedulerLifecycleIntegrationTest`): Tests parallel multi-service execution, slow-service non-blocking guarantees via synchronization latches, and Spring Boot application lifecycle startup/shutdown.
 * **Incident Detection & Recovery Tests** (`IncidentDetectionServiceTest`): Tests threshold-based incident creation, occurrence counter updates on repeated failures, streak resets on intermediate successes, automatic recovery resolution, and exception isolation.
 * **Incident Concurrency & Lifecycle Tests** (`IncidentConcurrencyTest`, `IncidentLifecycleIntegrationTest`): Tests concurrent health checks preventing duplicate open incidents via pessimistic locking and database constraints, and end-to-end failure -> incident -> recovery -> API query.
+* **Notification Dispatcher & Security Tests** (`NotificationOutboxRepositoryTest`, `OutboxDispatcherServiceTest`, `SafeSocketHttpClientTest`, `SlackNotificationChannelTest`, `WebhookNotificationChannelTest`, `RateLimiterRegistryTest`, `NotificationDeliveryIntegrationTest`, `NotificationControllerTest`): Validates transactional outbox claiming, lease expiration, exponential backoff, SSRF IP blocking and DNS rebinding protection, HMAC SHA-256 signatures, Slack block payloads, token-bucket rate limiting, and notification audit APIs.
+* **Statistical Anomaly Detection & Escalation Tests** (`PercentileCalculatorTest`, `RollingStatisticsCalculatorTest`, `IncidentSeverityEscalationTest`, `AnomalyDetectionServiceTest`, `AnomalyDetectionIntegrationTest`): Validates deterministic linear interpolation percentiles ($p95$, $p99$), rolling error rates, strict baseline isolation, anti-flapping breach and recovery streaks, monotonic severity escalation (`WARNING` -> `CRITICAL`), and `INCIDENT_ESCALATED` transactional outbox integration.
 * **Service Layer Unit Tests** (`ServiceManagementServiceTest`, `HealthCheckExecutionServiceTest`): Tests business logic, unique constraints, health check execution, and repository interactions using Mockito.
-* **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`, `IncidentControllerTest`): Validates HTTP contracts, Bean Validation rules, query filters, JSON serialization, and RFC 7807 error mappings using `MockMvc`.
-* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`, `IncidentRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1`, `V2`, `V3`), historical ordering, dynamic criteria specifications, group aggregation queries, and cascade deletes with `@DataJpaTest`.
+* **Controller Slice Tests** (`ServiceControllerTest`, `HealthCheckControllerTest`, `IncidentControllerTest`, `NotificationControllerTest`): Validates HTTP contracts, Bean Validation rules, query filters, JSON serialization, and RFC 7807 error mappings using `MockMvc`.
+* **Repository Slice Tests** (`ServiceRepositoryTest`, `HealthCheckRepositoryTest`, `IncidentRepositoryTest`, `NotificationOutboxRepositoryTest`): Tests JPA mappings, Flyway migrations (`V1`-`V5`), historical ordering, dynamic criteria specifications, group aggregation queries, and cascade deletes with `@DataJpaTest`.
 * **PostgreSQL Testcontainers** (`PulseGuardPostgresTestcontainersIntegrationTest`): Runs end-to-end against real PostgreSQL when a Docker daemon is available.
 
 ---
@@ -863,6 +923,142 @@ Response:
 
 ---
 
+## Phase 6 — Statistical Anomaly Detection & Adaptive Alerting
+
+PulseGuard incorporates a statistically grounded, zero-dependency anomaly detection and adaptive alerting subsystem. It continuously calculates historical rolling percentiles and error rates across isolated observation windows, detects sustained regressions, and automatically escalates incident severity from `WARNING` to `CRITICAL`.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Health Check Execution Result                         │
+│                    (CheckedAt, ResponseTimeMs, Result)                      │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                 Rolling Window Statistics Calculator                        │
+│   Observation Window: [now - 15m, now]   (Strictly isolated)                │
+│   Baseline Window:    [now - 75m, now - 15m] (Preceding, zero contamination)│
+│                                                                             │
+│   - p95 / p99: Deterministic linear interpolation on successful checks      │
+│   - Error Rate: N_failed / N_total                                          │
+│   - Sample Count Guard: N < minSamples => INSUFFICIENT_DATA (No Alert)      │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    ▼                                     ▼
+┌──────────────────────────────────────┐  ┌──────────────────────────────────┐
+│      Latency Regression Rule         │  │       High Error Rate Rule       │
+│ - p95_current >= M * p95_baseline    │  │ - error_rate >= threshold (25%)  │
+│   AND p95_current >= minAnomalyMs    │  │ - Suppressed if service is       │
+│ - OR p95_current >= hardThresholdMs  │  │   already SERVICE_UNAVAILABLE    │
+└──────────────────┬───────────────────┘  └──────────────────┬───────────────┘
+                   │                                         │
+                   └──────────────────┬──────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Anti-Flapping Evaluator                             │
+│   - Requires consecutive anomalous evaluations to open incident (default: 3)│
+│   - Requires consecutive healthy evaluations to resolve incident (default: 3)│
+└─────────────────────────────────────┬───────────────────────────────────────┘
+                                      │
+                   ┌──────────────────┴──────────────────┐
+                   ▼                                     ▼
+         [ Breach Streak Met ]                 [ Recovery Streak Met ]
+                   │                                     │
+                   ▼                                     ▼
+        Incident Lifecycle Event             Resolve Open Incident
+         - Initial: WARNING (or CRITICAL)     - State -> RESOLVED
+         - Record Occurrence                  - Outbox: INCIDENT_RESOLVED
+                   │
+                   ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Adaptive Severity Escalator                             │
+│   - Condition 1: Sustained degradation (occurrences >= escalationThreshold) │
+│   - Condition 2: Critical multiplier breach (factor >= criticalMultiplier)  │
+│   - Monotonic Severity: WARNING -> CRITICAL (no downgrade before resolution)│
+│   - Emits INCIDENT_ESCALATED outbox event (deduplicated by event key)       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Mathematical Definitions
+
+#### Percentile Calculation (Linear Interpolation)
+PulseGuard uses the standard linear interpolation method (equivalent to NIST / R-7 / NumPy default / Excel `PERCENTILE.INC`) over sorted latencies of successful health checks within the evaluation window:
+For percentile rank $P \in (0, 100]$ and sample count $N$:
+$$\text{Rank Index: } \text{idx} = \frac{P}{100} \times (N - 1)$$
+$$k = \lfloor \text{idx} \rfloor, \quad f = \text{idx} - k$$
+$$\text{Percentile Value: } p_P = v_k + f \times (v_{k+1} - v_k)$$
+
+This yields continuous, deterministic values and avoids the step-function artifacts that nearest-rank methods suffer from on small sample sizes. Latencies from failed or timed-out checks are excluded from the latency percentile pool.
+
+#### Rolling Error Rate
+The rolling error rate is computed over all checks in the observation window:
+$$\text{Error Rate} = \frac{N_{\text{failed}}}{N_{\text{total}}}$$
+where $N_{\text{failed}}$ is the count of checks where $\text{result} \neq \text{SUCCESS}$, and $N_{\text{total}}$ is the total count of executed checks in the window.
+
+#### Insufficient Sample Size Guard
+If $N_{\text{total}} < \text{minSamples}$ (default: 10), statistical calculations are skipped, the engine returns `INSUFFICIENT_DATA`, the `pulseguard.anomaly.insufficient_data.total` metric increments, and no alert or recovery is evaluated.
+
+#### Strict Baseline Isolation
+To prevent active degradation from polluting the baseline, the baseline window ($[now - W - B, now - W)$) strictly precedes the observation window ($[now - W, now]$). There is zero overlap between the current evaluation window and the historical baseline.
+
+### 2. Anomaly Detection & Escalation Rules
+
+1. **High Latency Regression (`HIGH_LATENCY`)**:
+   - **Baseline Regression**: Triggered when $p95_{\text{current}} \ge M \times p95_{\text{baseline}}$ (default multiplier: $2.0\times$) and $p95_{\text{current}} \ge \text{minAnomalyLatencyMs}$ (default: $200\text{ms}$). The absolute minimum guard prevents nuisance alerts on trivial baseline increases (e.g. $4\text{ms} \to 10\text{ms}$).
+   - **Absolute Threshold**: Triggered if $p95_{\text{current}} \ge \text{latencyThresholdMs}$ (default: $2000\text{ms}$), providing protection even before a baseline is established.
+2. **High Error Rate (`HIGH_ERROR_RATE`)**:
+   - Triggered when $\text{Error Rate} \ge \text{errorRateThreshold}$ (default: $0.25$, or $25\%$).
+   - **Non-Interference Guard**: If the service is already in an open `SERVICE_UNAVAILABLE` state, new `HIGH_ERROR_RATE` incident creation is suppressed to avoid redundant alarm fatigue.
+3. **Anti-Flapping Streaks**:
+   - Creating an incident requires $\ge \text{consecutiveBreachesThreshold}$ (default: $3$) consecutive anomalous window evaluations.
+   - Resolving an open anomaly incident requires $\ge \text{consecutiveSuccessesThreshold}$ (default: $3$) consecutive healthy evaluations.
+4. **Adaptive Severity Escalation**:
+   - Initial anomaly severity begins at `WARNING` (unless immediate critical threshold is exceeded).
+   - Escalates to `CRITICAL` when:
+     - Breach persists for $\ge \text{escalationConsecutiveBreachesThreshold}$ (default: $5$) evaluations, OR
+     - Latency exceeds $p95_{\text{baseline}} \times 3.5$ or absolute critical threshold ($5000\text{ms}$), OR
+     - Error rate exceeds critical threshold ($0.60$, or $60\%$).
+   - **Monotonic Severity**: Once escalated to `CRITICAL`, severity cannot downgrade back to `WARNING` before the incident is formally resolved.
+   - **Idempotent Outbox Delivery**: Escalation generates an `INCIDENT_ESCALATED` transactional outbox event. The deterministic event key `incident:{id}:ESCALATED:CRITICAL` ensures exactly-once outbox generation without duplicates.
+
+### 3. Configuration Reference
+
+All properties reside under the `pulseguard.anomaly` prefix:
+
+| Property | Environment Variable | Default | Description |
+|---|---|---|---|
+| `pulseguard.anomaly.enabled` | `PULSEGUARD_ANOMALY_ENABLED` | `true` | Master switch for anomaly detection |
+| `pulseguard.anomaly.observation-window` | `PULSEGUARD_ANOMALY_OBSERVATION_WINDOW` | `PT15M` | Duration of active evaluation window |
+| `pulseguard.anomaly.baseline-window` | `PULSEGUARD_ANOMALY_BASELINE_WINDOW` | `PT1H` | Duration of isolated historical baseline |
+| `pulseguard.anomaly.min-samples` | `PULSEGUARD_ANOMALY_MIN_SAMPLES` | `10` | Minimum checks required for evaluation |
+| `pulseguard.anomaly.latency-regression-multiplier` | `PULSEGUARD_ANOMALY_LATENCY_MULTIPLIER` | `2.0` | Multiplier over baseline p95 to flag regression |
+| `pulseguard.anomaly.min-anomaly-latency-ms` | `PULSEGUARD_ANOMALY_MIN_LATENCY_MS` | `200` | Minimum absolute ms for regression alert |
+| `pulseguard.anomaly.latency-threshold-ms` | `PULSEGUARD_ANOMALY_LATENCY_THRESHOLD_MS` | `2000` | Hard absolute p95 latency threshold |
+| `pulseguard.anomaly.critical-latency-multiplier` | `PULSEGUARD_ANOMALY_CRITICAL_LATENCY_MULTIPLIER` | `3.5` | Multiplier over baseline for CRITICAL severity |
+| `pulseguard.anomaly.critical-latency-threshold-ms` | `PULSEGUARD_ANOMALY_CRITICAL_LATENCY_THRESHOLD_MS` | `5000` | Hard absolute p95 threshold for CRITICAL severity |
+| `pulseguard.anomaly.error-rate-threshold` | `PULSEGUARD_ANOMALY_ERROR_RATE_THRESHOLD` | `0.25` | Error rate (0.0 - 1.0) for anomaly alert |
+| `pulseguard.anomaly.critical-error-rate-threshold` | `PULSEGUARD_ANOMALY_CRITICAL_ERROR_RATE_THRESHOLD` | `0.60` | Error rate (0.0 - 1.0) for CRITICAL escalation |
+| `pulseguard.anomaly.consecutive-breaches-threshold` | `PULSEGUARD_ANOMALY_CONSECUTIVE_BREACHES` | `3` | Consecutive breaches to open incident |
+| `pulseguard.anomaly.consecutive-successes-threshold` | `PULSEGUARD_ANOMALY_CONSECUTIVE_SUCCESSES` | `3` | Consecutive successes to resolve incident |
+| `pulseguard.anomaly.escalation-consecutive-breaches-threshold` | `PULSEGUARD_ANOMALY_ESCALATION_BREACHES` | `5` | Consecutive breaches to escalate to CRITICAL |
+| `pulseguard.anomaly.max-history-checks` | `PULSEGUARD_ANOMALY_MAX_HISTORY_CHECKS` | `500` | Bounded limit per window query |
+
+### 4. Observability & Metrics
+
+Low-cardinality Micrometer counters exposed via `/actuator/metrics`:
+
+| Metric Name | Tags | Description |
+|---|---|---|
+| `pulseguard.anomaly.evaluations.total` | `outcome=NORMAL\|ANOMALOUS\|INSUFFICIENT_DATA\|SKIPPED` | Total anomaly evaluations executed |
+| `pulseguard.anomaly.detected.total` | `type=HIGH_LATENCY\|HIGH_ERROR_RATE` | Anomalies detected by category |
+| `pulseguard.anomaly.escalations.total` | `type=HIGH_LATENCY\|HIGH_ERROR_RATE` | Severity escalations to CRITICAL |
+| `pulseguard.anomaly.insufficient_data.total` | none | Evaluations skipped due to low sample count |
+| `pulseguard.anomaly.evaluation.failures.total` | none | Evaluation processing exceptions caught safely |
+
+---
+
 ## Known Limitations
 
 - **At-Least-Once Delivery & Duplicate Window**: If a destination accepts an alert but the connection terminates before the HTTP response code is read by PulseGuard, or if a slow delivery worker exceeds its lease duration, PulseGuard may redeliver the event. Consumers should use `Idempotency-Key` or `eventId` to achieve idempotency. Note that Slack Incoming Webhooks do not natively support idempotency keys.
@@ -879,5 +1075,7 @@ Response:
 * **Phase 3 (Completed)**: Automated background scheduling engine with bounded `ThreadPoolTaskExecutor`, independent per-service check intervals, same-service overlap protection, failure isolation, graceful shutdown, and scheduler Micrometer metrics.
 * **Phase 4 (Completed)**: Incident Detection & Recovery Engine, deterministic consecutive-failure thresholds, automated recovery resolution, occurrence counters, pessimistic row locking and database partial unique constraint against concurrent duplicate incidents, incident history & filtering REST APIs (`/api/v1/incidents`), and Micrometer observability.
 * **Phase 5 (Completed)**: Alerting & Notification Dispatcher Engine, Transactional Outbox pattern, lease-based concurrent claiming, bounded exponential backoff with jitter, SSRF and DNS-rebinding defense via pinned-IP socket client, Generic Signed Webhook channel, Slack channel, token-bucket rate limiting, management audit APIs (`/api/v1/notifications`), and Micrometer observability.
-* **Phase 6 (Proposed)**: Statistical Anomaly & Latency Drift Detection — dynamic percentile-based latency thresholds ($p95$, $p99$), moving-average error rate spike detection, automated incident severity escalation (WARNING -> CRITICAL), and authenticated notification administration.
+* **Phase 6 (Completed)**: Statistical Anomaly Detection & Adaptive Alerting — deterministic linear interpolation percentiles ($p95$, $p99$), isolated historical baseline window queries, error rate spike detection, anti-flapping streaks, monotonic severity escalation (`WARNING` -> `CRITICAL`), `INCIDENT_ESCALATED` outbox event generation, Flyway `V5` migration, and low-cardinality Micrometer metrics.
+* **Phase 7 (Proposed)**: Distributed Heartbeats & Multi-Region Health Coordination — active agent heartbeats, multi-region quorum-based health consensus, distributed probing across edge nodes, and synthetic transaction monitoring.
+
 

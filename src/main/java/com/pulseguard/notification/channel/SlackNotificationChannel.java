@@ -101,6 +101,10 @@ public class SlackNotificationChannel extends AbstractHttpNotificationChannel {
                 icon = ":white_check_mark:";
                 title = "Incident resolved";
             }
+            case INCIDENT_ESCALATED -> {
+                icon = ":arrow_double_up:";
+                title = "Incident escalated";
+            }
             default -> {
                 icon = ":information_source:";
                 title = "Incident update";

@@ -153,4 +153,28 @@ class OutboxNotificationEnqueuerTest {
         verify(outboxRepository).save(captor.capture());
         assertThat(captor.getValue().getEventType()).isEqualTo(NotificationEventType.INCIDENT_RESOLVED);
     }
+
+    @Test
+    @DisplayName("incidentEscalated saves escalated event row with deterministic eventId")
+    void incidentEscalatedSavesRow() {
+        incident.escalate(IncidentSeverity.CRITICAL, Instant.now(), "Latency breach sustained");
+        enqueuer.incidentEscalated(incident);
+
+        ArgumentCaptor<NotificationOutbox> captor = ArgumentCaptor.forClass(NotificationOutbox.class);
+        verify(outboxRepository).save(captor.capture());
+        NotificationOutbox saved = captor.getValue();
+        assertThat(saved.getEventType()).isEqualTo(NotificationEventType.INCIDENT_ESCALATED);
+        assertThat(saved.getPayload()).contains("CRITICAL");
+    }
+
+    @Test
+    @DisplayName("incidentEscalated skips saving if eventId already exists for channel")
+    void incidentEscalatedSkipsDuplicate() {
+        incident.escalate(IncidentSeverity.CRITICAL, Instant.now(), "Latency breach sustained");
+        when(outboxRepository.existsByEventIdAndChannel(any(), any())).thenReturn(true);
+
+        enqueuer.incidentEscalated(incident);
+
+        verify(outboxRepository, never()).save(any());
+    }
 }

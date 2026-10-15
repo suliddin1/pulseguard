@@ -56,9 +56,20 @@ public class HealthCheck {
             HealthCheckResult result,
             String errorMessage
     ) {
+        this(service, Instant.now(), responseTimeMs, httpStatusCode, result, errorMessage);
+    }
+
+    public HealthCheck(
+            MonitoredService service,
+            Instant checkedAt,
+            long responseTimeMs,
+            Integer httpStatusCode,
+            HealthCheckResult result,
+            String errorMessage
+    ) {
         this.id = UUID.randomUUID();
         this.service = Objects.requireNonNull(service, "Service must not be null");
-        this.checkedAt = Instant.now();
+        this.checkedAt = checkedAt != null ? checkedAt : Instant.now();
         this.responseTimeMs = Math.max(0, responseTimeMs);
         this.httpStatusCode = httpStatusCode;
         this.result = Objects.requireNonNull(result, "Result must not be null");

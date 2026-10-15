@@ -43,4 +43,10 @@ pulseguard:
       initial-delay-ms: 60000
     security:
       allow-unsafe-destinations: true
+  anomaly:
+    enabled: true
+    min-samples: 5
+    consecutive-breaches-threshold: 2
+    consecutive-successes-threshold: 2
+    escalation-consecutive-breaches-threshold: 3
 

@@ -85,6 +85,12 @@ public class OutboxNotificationEnqueuer implements NotificationEnqueuer {
         enqueue(incident, NotificationEventType.INCIDENT_RESOLVED, "incident:" + incident.getId() + ":RESOLVED");
     }
 
+    @Override
+    public void incidentEscalated(Incident incident) {
+        enqueue(incident, NotificationEventType.INCIDENT_ESCALATED,
+                "incident:" + incident.getId() + ":ESCALATED:" + incident.getSeverity());
+    }
+
     private void enqueue(Incident incident, NotificationEventType eventType, String eventKey) {
         List<NotificationChannelType> channels = channelRegistry.enabledTypes();
         if (channels.isEmpty()) {

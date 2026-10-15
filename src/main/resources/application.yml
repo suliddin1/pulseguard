@@ -61,6 +61,22 @@ pulseguard:
     consecutive-failures-threshold: ${PULSEGUARD_INCIDENT_FAILURES_THRESHOLD:3}
     consecutive-successes-threshold: ${PULSEGUARD_INCIDENT_SUCCESSES_THRESHOLD:1}
     initial-severity: ${PULSEGUARD_INCIDENT_INITIAL_SEVERITY:CRITICAL}
+  anomaly:
+    enabled: ${PULSEGUARD_ANOMALY_ENABLED:true}
+    observation-window: ${PULSEGUARD_ANOMALY_OBSERVATION_WINDOW:PT15M}
+    baseline-window: ${PULSEGUARD_ANOMALY_BASELINE_WINDOW:PT1H}
+    min-samples: ${PULSEGUARD_ANOMALY_MIN_SAMPLES:10}
+    latency-regression-multiplier: ${PULSEGUARD_ANOMALY_LATENCY_MULTIPLIER:2.0}
+    min-anomaly-latency-ms: ${PULSEGUARD_ANOMALY_MIN_LATENCY_MS:200}
+    latency-threshold-ms: ${PULSEGUARD_ANOMALY_LATENCY_THRESHOLD_MS:2000}
+    critical-latency-multiplier: ${PULSEGUARD_ANOMALY_CRITICAL_LATENCY_MULTIPLIER:3.5}
+    critical-latency-threshold-ms: ${PULSEGUARD_ANOMALY_CRITICAL_LATENCY_THRESHOLD_MS:5000}
+    error-rate-threshold: ${PULSEGUARD_ANOMALY_ERROR_RATE_THRESHOLD:0.25}
+    critical-error-rate-threshold: ${PULSEGUARD_ANOMALY_CRITICAL_ERROR_RATE_THRESHOLD:0.60}
+    consecutive-breaches-threshold: ${PULSEGUARD_ANOMALY_CONSECUTIVE_BREACHES:3}
+    consecutive-successes-threshold: ${PULSEGUARD_ANOMALY_CONSECUTIVE_SUCCESSES:3}
+    escalation-consecutive-breaches-threshold: ${PULSEGUARD_ANOMALY_ESCALATION_BREACHES:5}
+    max-history-checks: ${PULSEGUARD_ANOMALY_MAX_HISTORY_CHECKS:500}
   notifications:
     dispatcher:
       enabled: ${PULSEGUARD_NOTIFICATIONS_DISPATCHER_ENABLED:true}

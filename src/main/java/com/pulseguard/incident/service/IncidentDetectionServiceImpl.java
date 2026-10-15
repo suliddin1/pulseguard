@@ -34,6 +34,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
     private final IncidentProperties incidentProperties;
     private final IncidentMetrics incidentMetrics;
     private final NotificationEnqueuer notificationEnqueuer;
+    private final AnomalyDetectionService anomalyDetectionService;
 
     public IncidentDetectionServiceImpl(
             IncidentRepository incidentRepository,
@@ -42,11 +43,24 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             IncidentMetrics incidentMetrics,
             NotificationEnqueuer notificationEnqueuer
     ) {
+        this(incidentRepository, healthCheckRepository, incidentProperties, incidentMetrics, notificationEnqueuer, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public IncidentDetectionServiceImpl(
+            IncidentRepository incidentRepository,
+            HealthCheckRepository healthCheckRepository,
+            IncidentProperties incidentProperties,
+            IncidentMetrics incidentMetrics,
+            NotificationEnqueuer notificationEnqueuer,
+            @org.springframework.beans.factory.annotation.Autowired(required = false) AnomalyDetectionService anomalyDetectionService
+    ) {
         this.incidentRepository = incidentRepository;
         this.healthCheckRepository = healthCheckRepository;
         this.incidentProperties = incidentProperties;
         this.incidentMetrics = incidentMetrics;
         this.notificationEnqueuer = notificationEnqueuer;
+        this.anomalyDetectionService = anomalyDetectionService;
     }
 
     @Override
@@ -70,6 +84,19 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             incidentMetrics.recordProcessingFailure();
             log.error("Failed to process incident evaluation for service '{}' (ID: {}): {}",
                     service.getName(), service.getId(), ex.getMessage(), ex);
+        }
+
+        if (anomalyDetectionService != null) {
+            try {
+                anomalyDetectionService.evaluateAnomalies(service, healthCheck);
+            } catch (NotificationEnqueueException ex) {
+                log.error("Failed to enqueue notification during anomaly detection for service '{}' (ID: {}): {}",
+                        service.getName(), service.getId(), ex.getMessage(), ex);
+                throw ex;
+            } catch (Exception ex) {
+                log.error("Failed to evaluate anomalies for service '{}' (ID: {}): {}",
+                        service.getName(), service.getId(), ex.getMessage(), ex);
+            }
         }
     }
 
