@@ -52,28 +52,32 @@ public class NotificationConfiguration {
 
         if (properties.getWebhook().isEnabled()) {
             String url = properties.getWebhook().getUrl();
-            if (url.isBlank()) {
+            if (url == null || url.isBlank()) {
                 throw new IllegalStateException("Webhook notification channel is enabled but no URL is configured");
             }
             try {
-                URI uri = URI.create(url);
+                URI uri = URI.create(url.trim());
                 policy.validateStatic(uri);
-            } catch (Exception ex) {
+            } catch (com.pulseguard.notification.security.DestinationNotAllowedException ex) {
                 throw new IllegalStateException("Webhook URL violates outbound destination policy: " + ex.getMessage());
+            } catch (Exception ex) {
+                throw new IllegalStateException("Webhook URL violates outbound destination policy: malformed URL");
             }
         }
 
         if (properties.getSlack().isEnabled()) {
             String url = properties.getSlack().getWebhookUrl();
-            if (url.isBlank()) {
+            if (url == null || url.isBlank()) {
                 throw new IllegalStateException("Slack notification channel is enabled but no webhook URL is configured");
             }
             try {
-                URI uri = URI.create(url);
+                URI uri = URI.create(url.trim());
                 policy.validateStatic(uri);
                 SlackNotificationChannel.requireSlackHost(uri, properties.getSecurity().isAllowUnsafeDestinations());
-            } catch (Exception ex) {
+            } catch (com.pulseguard.notification.security.DestinationNotAllowedException ex) {
                 throw new IllegalStateException("Slack webhook URL violates destination policy: " + ex.getMessage());
+            } catch (Exception ex) {
+                throw new IllegalStateException("Slack webhook URL violates destination policy: malformed URL");
             }
         }
     }
@@ -82,9 +86,8 @@ public class NotificationConfiguration {
     public ThreadPoolTaskExecutor notificationTaskExecutor(NotificationProperties properties) {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         int maxConcurrency = Math.max(1, properties.getDispatcher().getMaxConcurrentDeliveries());
-        int corePoolSize = Math.max(1, maxConcurrency / 2);
 
-        executor.setCorePoolSize(corePoolSize);
+        executor.setCorePoolSize(maxConcurrency);
         executor.setMaxPoolSize(maxConcurrency);
         executor.setQueueCapacity(properties.getDispatcher().getQueueCapacity());
         executor.setThreadNamePrefix("pg-notify-");

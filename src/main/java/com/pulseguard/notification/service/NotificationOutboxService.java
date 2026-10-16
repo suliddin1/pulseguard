@@ -62,11 +62,15 @@ public class NotificationOutboxService {
             return List.of();
         }
         Duration lease = properties.getDispatcher().getLeaseDuration();
+        int candidateLimit = Math.min(Math.max(limit * 4, limit), 500);
         List<UUID> candidates = outboxRepository.findClaimableIds(
-                now, OutboxStatus.PENDING, OutboxStatus.PROCESSING, PageRequest.of(0, limit));
+                now, OutboxStatus.PENDING, OutboxStatus.PROCESSING, PageRequest.of(0, candidateLimit));
 
         List<ClaimedNotification> claimed = new ArrayList<>();
         for (UUID id : candidates) {
+            if (claimed.size() >= limit) {
+                break;
+            }
             String token = UUID.randomUUID().toString();
             int updated = outboxRepository.claim(
                     id, token, now.plus(lease), now, OutboxStatus.PENDING, OutboxStatus.PROCESSING);
@@ -80,7 +84,7 @@ public class NotificationOutboxService {
             if (row.getAttemptCount() > properties.getRetry().getMaxAttempts()) {
                 // Re-claimed after lease expiry more often than allowed: the delivery keeps killing its
                 // worker or never completes. Stop it instead of looping forever.
-                outboxRepository.completeDead(id, token, now, "lease_attempts_exceeded", row.getLastHttpStatus(),
+                outboxRepository.completeDeadWithoutAttempt(id, token, now, "lease_attempts_exceeded", row.getLastHttpStatus(),
                         OutboxStatus.DEAD, OutboxStatus.PROCESSING);
                 metrics.dead(row.getChannel(), DeadReason.LEASE_ATTEMPTS_EXCEEDED);
                 log.warn("Notification {} dead-lettered: attempts exceeded after lease expiry", id);
@@ -132,7 +136,7 @@ public class NotificationOutboxService {
     /** Dead-letters without a delivery attempt (e.g. channel disabled), still recording why. */
     @Transactional
     public boolean recordDeadWithoutAttempt(ClaimedNotification claim, String error, Instant now) {
-        return outboxRepository.completeDead(
+        return outboxRepository.completeDeadWithoutAttempt(
                 claim.id(), claim.leaseToken(), now, NotificationAttempt.truncate(error), null,
                 OutboxStatus.DEAD, OutboxStatus.PROCESSING) == 1;
     }

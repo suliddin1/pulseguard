@@ -21,14 +21,16 @@ public class JavaHttpHealthProber implements HttpHealthProber {
 
     private static final Logger log = LoggerFactory.getLogger(JavaHttpHealthProber.class);
     private static final String USER_AGENT = "PulseGuard-HealthProber/1.0";
+    private static final com.pulseguard.notification.security.Redactor REDACTOR =
+            new com.pulseguard.notification.security.Redactor(java.util.List.of());
 
     private final HttpClient httpClient;
 
     public JavaHttpHealthProber() {
         this(HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .connectTimeout(Duration.ofSeconds(60))
                 .build());
     }
 
@@ -55,54 +57,54 @@ public class JavaHttpHealthProber implements HttpHealthProber {
                     .GET()
                     .build();
 
-            log.debug("Probing target URL '{}' with timeout {}ms", targetUrl, effectiveTimeout);
+            log.debug("Probing target URL '{}' with timeout {}ms", REDACTOR.redact(targetUrl), effectiveTimeout);
             HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
             long elapsedMs = calculateElapsedMs(startTime);
             int statusCode = response.statusCode();
 
             if (statusCode >= 200 && statusCode < 300) {
-                log.debug("Probe to '{}' SUCCEEDED with HTTP {} in {}ms", targetUrl, statusCode, elapsedMs);
+                log.debug("Probe to '{}' SUCCEEDED with HTTP {} in {}ms", REDACTOR.redact(targetUrl), statusCode, elapsedMs);
                 return ProbeResult.success(elapsedMs, statusCode);
             } else {
-                log.warn("Probe to '{}' FAILED with HTTP {} in {}ms", targetUrl, statusCode, elapsedMs);
+                log.warn("Probe to '{}' FAILED with HTTP {} in {}ms", REDACTOR.redact(targetUrl), statusCode, elapsedMs);
                 return ProbeResult.failure(elapsedMs, statusCode, "HTTP check returned non-2xx status: " + statusCode);
             }
 
         } catch (HttpTimeoutException ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' TIMED OUT after {}ms: {}", targetUrl, elapsedMs, ex.getMessage());
+            log.warn("Probe to '{}' TIMED OUT after {}ms: {}", REDACTOR.redact(targetUrl), elapsedMs, REDACTOR.redact(ex.getMessage()));
             return ProbeResult.timeout(elapsedMs, "HTTP probe timed out after " + effectiveTimeout + "ms");
 
         } catch (ConnectException ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' FAILED with connection refusal in {}ms: {}", targetUrl, elapsedMs, ex.getMessage());
-            return ProbeResult.failure(elapsedMs, null, "Connection refused: " + ex.getMessage());
+            log.warn("Probe to '{}' FAILED with connection refusal in {}ms: {}", REDACTOR.redact(targetUrl), elapsedMs, REDACTOR.redact(ex.getMessage()));
+            return ProbeResult.failure(elapsedMs, null, "Connection refused: " + REDACTOR.redact(ex.getMessage()));
 
         } catch (UnknownHostException ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' FAILED with unknown host in {}ms: {}", targetUrl, elapsedMs, ex.getMessage());
-            return ProbeResult.failure(elapsedMs, null, "Unknown host: " + ex.getMessage());
+            log.warn("Probe to '{}' FAILED with unknown host in {}ms: {}", REDACTOR.redact(targetUrl), elapsedMs, REDACTOR.redact(ex.getMessage()));
+            return ProbeResult.failure(elapsedMs, null, "Unknown host: " + REDACTOR.redact(ex.getMessage()));
 
         } catch (IOException ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' FAILED with I/O error in {}ms: {}", targetUrl, elapsedMs, ex.getMessage());
-            return ProbeResult.failure(elapsedMs, null, "Network I/O error: " + ex.getMessage());
+            log.warn("Probe to '{}' FAILED with I/O error in {}ms: {}", REDACTOR.redact(targetUrl), elapsedMs, REDACTOR.redact(ex.getMessage()));
+            return ProbeResult.failure(elapsedMs, null, "Network I/O error: " + REDACTOR.redact(ex.getMessage()));
 
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' was interrupted in {}ms", targetUrl, elapsedMs);
+            log.warn("Probe to '{}' was interrupted in {}ms", REDACTOR.redact(targetUrl), elapsedMs);
             return ProbeResult.failure(elapsedMs, null, "Health check probe was interrupted");
 
         } catch (IllegalArgumentException ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.warn("Probe to '{}' failed with invalid URL: {}", targetUrl, ex.getMessage());
-            return ProbeResult.failure(elapsedMs, null, "Malformed URL: " + ex.getMessage());
+            log.warn("Probe to '{}' failed with invalid URL: {}", REDACTOR.redact(targetUrl), REDACTOR.redact(ex.getMessage()));
+            return ProbeResult.failure(elapsedMs, null, "Malformed URL: " + REDACTOR.redact(ex.getMessage()));
 
         } catch (Exception ex) {
             long elapsedMs = calculateElapsedMs(startTime);
-            log.error("Unexpected error probing '{}' in {}ms: {}", targetUrl, elapsedMs, ex.getMessage(), ex);
-            return ProbeResult.failure(elapsedMs, null, "Unexpected probe error: " + ex.getMessage());
+            log.error("Unexpected error probing '{}' in {}ms: {}", REDACTOR.redact(targetUrl), elapsedMs, REDACTOR.redact(ex.getMessage()), ex);
+            return ProbeResult.failure(elapsedMs, null, "Unexpected probe error: " + REDACTOR.redact(ex.getMessage()));
         }
     }
 

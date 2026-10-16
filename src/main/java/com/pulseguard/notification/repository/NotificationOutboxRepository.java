@@ -123,6 +123,24 @@ public interface NotificationOutboxRepository
             @Param("processing") OutboxStatus processing
     );
 
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update NotificationOutbox o
+               set o.status = :dead, o.leaseToken = null, o.leaseExpiresAt = null,
+                   o.attemptCount = case when o.attemptCount > 0 then o.attemptCount - 1 else 0 end,
+                   o.updatedAt = :now, o.lastError = :error, o.lastHttpStatus = :httpStatus
+             where o.id = :id and o.status = :processing and o.leaseToken = :token
+            """)
+    int completeDeadWithoutAttempt(
+            @Param("id") UUID id,
+            @Param("token") String token,
+            @Param("now") Instant now,
+            @Param("error") String error,
+            @Param("httpStatus") Integer httpStatus,
+            @Param("dead") OutboxStatus dead,
+            @Param("processing") OutboxStatus processing
+    );
+
     /** Gives back a claim without consuming an attempt (used when rate limited before sending). */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""

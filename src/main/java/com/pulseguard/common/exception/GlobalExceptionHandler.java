@@ -210,6 +210,22 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse);
     }
 
+    @ExceptionHandler(org.springframework.data.mapping.PropertyReferenceException.class)
+    public ResponseEntity<ErrorResponse> handlePropertyReferenceException(
+            org.springframework.data.mapping.PropertyReferenceException ex,
+            HttpServletRequest request
+    ) {
+        String message = String.format("Invalid sort property '%s'", ex.getPropertyName());
+        log.warn("Invalid sort property at [{}]: {}", request.getRequestURI(), message);
+        ErrorResponse errorResponse = ErrorResponse.of(
+                HttpStatus.BAD_REQUEST.value(),
+                HttpStatus.BAD_REQUEST.getReasonPhrase(),
+                message,
+                request.getRequestURI()
+        );
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorResponse);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleGeneralException(
             Exception ex,

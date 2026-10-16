@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: ${DB_USER:-pulseguard_user}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-pulseguard_secret_change_in_production}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

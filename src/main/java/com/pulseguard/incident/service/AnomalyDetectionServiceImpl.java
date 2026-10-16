@@ -82,7 +82,7 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
             Instant obsEnd = now.plusSeconds(1);
 
             Instant baseStart = obsStart.minus(anomalyProperties.getBaselineWindow());
-            Instant baseEnd = obsStart;
+            Instant baseEnd = obsStart.minusNanos(1);
 
             PageRequest bound = PageRequest.of(0, anomalyProperties.getMaxHistoryChecks(), Sort.by(Sort.Direction.DESC, "checkedAt"));
 
@@ -139,6 +139,7 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
     ) {
         if (currentStats.successChecks() == 0) {
             // No successful checks to calculate latency percentiles
+            tracker.latencyBreaches.set(0);
             return false;
         }
 
@@ -193,14 +194,18 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
                     );
                     incident.escalate(IncidentSeverity.CRITICAL, latestCheck.getCheckedAt(), escalationDetails);
                     incidentRepository.save(incident);
-                    anomalyMetrics.recordEscalation(IncidentType.HIGH_LATENCY);
                     notificationEnqueuer.incidentEscalated(incident);
+                    incidentMetrics.recordOccurrence();
+                    anomalyMetrics.recordEscalation(IncidentType.HIGH_LATENCY);
                     log.warn("Escalated HIGH_LATENCY incident {} to CRITICAL for service '{}'",
                             incident.getId(), service.getName());
                 } else {
                     incidentRepository.save(incident);
-                    incidentMetrics.recordOccurrence();
                     notificationEnqueuer.incidentOccurrence(incident);
+                    incidentMetrics.recordOccurrence();
+                }
+                if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.HEALTHY) {
+                    service.updateStatus(com.pulseguard.service.model.ServiceStatus.DEGRADED);
                 }
             } else if (breaches >= anomalyProperties.getConsecutiveBreachesThreshold()) {
                 IncidentSeverity initialSeverity = isCritical ? IncidentSeverity.CRITICAL : IncidentSeverity.WARNING;
@@ -218,21 +223,16 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
 
                 try {
                     Incident saved = incidentRepository.save(incident);
-                    incidentMetrics.recordCreated();
                     notificationEnqueuer.incidentOpened(saved);
+                    incidentMetrics.recordCreated();
                     tracker.latencyBreaches.set(0);
+                    if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.HEALTHY) {
+                        service.updateStatus(com.pulseguard.service.model.ServiceStatus.DEGRADED);
+                    }
                     log.warn("Created HIGH_LATENCY incident for service '{}': severity={}, p95=%.1fms",
                             service.getName(), saved.getSeverity(), p95);
                 } catch (DataIntegrityViolationException ex) {
                     log.warn("Concurrent HIGH_LATENCY incident caught by unique constraint for service '{}'", service.getName());
-                    incidentRepository.findByServiceIdAndIncidentTypeAndStatus(
-                            serviceId, IncidentType.HIGH_LATENCY, IncidentStatus.OPEN
-                    ).ifPresent(existing -> {
-                        existing.recordOccurrence(latestCheck.getCheckedAt(), details);
-                        incidentRepository.save(existing);
-                        incidentMetrics.recordOccurrence();
-                        notificationEnqueuer.incidentOccurrence(existing);
-                    });
                 }
             }
         } else {
@@ -247,9 +247,12 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
                     );
                     incident.resolve(latestCheck.getCheckedAt(), resolution);
                     incidentRepository.save(incident);
-                    incidentMetrics.recordResolved();
                     notificationEnqueuer.incidentResolved(incident);
+                    incidentMetrics.recordResolved();
                     tracker.latencyRecoveries.set(0);
+                    if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.DEGRADED) {
+                        service.updateStatus(com.pulseguard.service.model.ServiceStatus.HEALTHY);
+                    }
                     log.info("Resolved HIGH_LATENCY incident for service '{}' (ID: {})", service.getName(), incident.getId());
                 }
             }
@@ -274,11 +277,15 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
         );
         boolean hasOpenIncident = openIncidentOpt != null && openIncidentOpt.isPresent();
 
-        // Suppress opening redundant HIGH_ERROR_RATE incident if SERVICE_UNAVAILABLE is already active
+        // Suppress redundant HIGH_ERROR_RATE streak accumulation and incident creation if SERVICE_UNAVAILABLE is active
         Optional<Incident> unavailableOpt = incidentRepository.findByServiceIdAndIncidentTypeAndStatus(
                 serviceId, IncidentType.SERVICE_UNAVAILABLE, IncidentStatus.OPEN
         );
         boolean isServiceUnavailable = unavailableOpt != null && unavailableOpt.isPresent();
+        if (isServiceUnavailable) {
+            tracker.errorRateBreaches.set(0);
+            return false;
+        }
 
         if (isAnomalous) {
             tracker.errorRateRecoveries.set(0);
@@ -302,16 +309,20 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
                     );
                     incident.escalate(IncidentSeverity.CRITICAL, latestCheck.getCheckedAt(), escalationDetails);
                     incidentRepository.save(incident);
-                    anomalyMetrics.recordEscalation(IncidentType.HIGH_ERROR_RATE);
                     notificationEnqueuer.incidentEscalated(incident);
+                    incidentMetrics.recordOccurrence();
+                    anomalyMetrics.recordEscalation(IncidentType.HIGH_ERROR_RATE);
                     log.warn("Escalated HIGH_ERROR_RATE incident {} to CRITICAL for service '{}'",
                             incident.getId(), service.getName());
                 } else {
                     incidentRepository.save(incident);
-                    incidentMetrics.recordOccurrence();
                     notificationEnqueuer.incidentOccurrence(incident);
+                    incidentMetrics.recordOccurrence();
                 }
-            } else if (!isServiceUnavailable && breaches >= anomalyProperties.getConsecutiveBreachesThreshold()) {
+                if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.HEALTHY) {
+                    service.updateStatus(com.pulseguard.service.model.ServiceStatus.DEGRADED);
+                }
+            } else if (breaches >= anomalyProperties.getConsecutiveBreachesThreshold()) {
                 IncidentSeverity initialSeverity = isCritical ? IncidentSeverity.CRITICAL : IncidentSeverity.WARNING;
                 String summary = String.format("High error rate detected on '%s': %.1f%% failed checks",
                         service.getName(), errorRate * 100.0);
@@ -328,21 +339,16 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
 
                 try {
                     Incident saved = incidentRepository.save(incident);
-                    incidentMetrics.recordCreated();
                     notificationEnqueuer.incidentOpened(saved);
+                    incidentMetrics.recordCreated();
                     tracker.errorRateBreaches.set(0);
+                    if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.HEALTHY) {
+                        service.updateStatus(com.pulseguard.service.model.ServiceStatus.DEGRADED);
+                    }
                     log.warn("Created HIGH_ERROR_RATE incident for service '{}': severity={}, errorRate=%.1f%%",
                             service.getName(), saved.getSeverity(), errorRate * 100.0);
                 } catch (DataIntegrityViolationException ex) {
                     log.warn("Concurrent HIGH_ERROR_RATE incident caught by unique constraint for service '{}'", service.getName());
-                    incidentRepository.findByServiceIdAndIncidentTypeAndStatus(
-                            serviceId, IncidentType.HIGH_ERROR_RATE, IncidentStatus.OPEN
-                    ).ifPresent(existing -> {
-                        existing.recordOccurrence(latestCheck.getCheckedAt(), details);
-                        incidentRepository.save(existing);
-                        incidentMetrics.recordOccurrence();
-                        notificationEnqueuer.incidentOccurrence(existing);
-                    });
                 }
             }
         } else {
@@ -357,9 +363,12 @@ public class AnomalyDetectionServiceImpl implements AnomalyDetectionService {
                     );
                     incident.resolve(latestCheck.getCheckedAt(), resolution);
                     incidentRepository.save(incident);
-                    incidentMetrics.recordResolved();
                     notificationEnqueuer.incidentResolved(incident);
+                    incidentMetrics.recordResolved();
                     tracker.errorRateRecoveries.set(0);
+                    if (service.getStatus() == com.pulseguard.service.model.ServiceStatus.DEGRADED) {
+                        service.updateStatus(com.pulseguard.service.model.ServiceStatus.HEALTHY);
+                    }
                     log.info("Resolved HIGH_ERROR_RATE incident for service '{}' (ID: {})", service.getName(), incident.getId());
                 }
             }

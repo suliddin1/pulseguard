@@ -124,4 +124,53 @@ class DestinationPolicyTest {
         assertThat(resolved.addresses()).containsExactly(publicIp);
         assertThat(resolved.requestTarget()).isEqualTo("/webhook?key=value");
     }
+
+    @Test
+    @DisplayName("isBlocked blocks IPv4-mapped and IPv4-translated 16-byte IPv6 addresses targeting private/loopback ranges")
+    void isBlockedBlocksIpv4MappedAndTranslatedIpv6() throws Exception {
+        // ::ffff:127.0.0.1 as raw 16-byte Inet6Address
+        byte[] mappedLoopback = new byte[16];
+        mappedLoopback[10] = (byte) 0xff;
+        mappedLoopback[11] = (byte) 0xff;
+        mappedLoopback[12] = 127;
+        mappedLoopback[15] = 1;
+        InetAddress v6MappedLoopback = java.net.Inet6Address.getByAddress("mapped", mappedLoopback, -1);
+        assertThat(DestinationPolicy.isBlocked(v6MappedLoopback)).isTrue();
+
+        // ::ffff:0:10.0.0.1 (SIIT IPv4-translated)
+        byte[] translatedPrivate = new byte[16];
+        translatedPrivate[8] = (byte) 0xff;
+        translatedPrivate[9] = (byte) 0xff;
+        translatedPrivate[12] = 10;
+        translatedPrivate[15] = 1;
+        InetAddress v6Translated = java.net.Inet6Address.getByAddress("translated", translatedPrivate, -1);
+        assertThat(DestinationPolicy.isBlocked(v6Translated)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://0177.0.0.1/hook",
+            "https://127.0.0.01/hook"
+    })
+    @DisplayName("validateStatic blocks octal 4-part IPv4 literals accepted by URI.getHost()")
+    void validateStaticBlocksOctalDottedIpv4Literals(String url) {
+        DestinationPolicy policy = new DestinationPolicy(HostResolver.SYSTEM, false, Set.of());
+        assertThatThrownBy(() -> policy.validateStatic(URI.create(url)))
+                .isInstanceOf(DestinationNotAllowedException.class)
+                .hasMessageContaining("non-canonical IPv4 literal");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "https://0x7f.0.0.1/hook",
+            "https://0x7f000001/hook",
+            "https://2130706433/hook",
+            "https://127.1/hook"
+    })
+    @DisplayName("validateStatic blocks hex, integer, and short-decimal IPv4 authority literals")
+    void validateStaticBlocksHexIntegerAndShortIpv4Authority(String url) {
+        DestinationPolicy policy = new DestinationPolicy(HostResolver.SYSTEM, false, Set.of());
+        assertThatThrownBy(() -> policy.validateStatic(URI.create(url)))
+                .isInstanceOf(DestinationNotAllowedException.class);
+    }
 }

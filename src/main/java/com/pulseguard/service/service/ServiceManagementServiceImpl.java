@@ -24,6 +24,7 @@ import java.util.UUID;
 public class ServiceManagementServiceImpl implements ServiceManagementService {
 
     private static final Logger log = LoggerFactory.getLogger(ServiceManagementServiceImpl.class);
+    private static final int MAX_PAGE_SIZE = 100;
 
     private final ServiceRepository serviceRepository;
 
@@ -36,7 +37,9 @@ public class ServiceManagementServiceImpl implements ServiceManagementService {
     public ServiceResponse createService(CreateServiceRequest request) {
         log.info("Registering new monitored service with name: '{}', URL: '{}'", request.name(), request.url());
 
-        String trimmedName = request.name().trim();
+        String trimmedName = validateAndTrimName(request.name());
+        String trimmedUrl = validateAndTrimUrl(request.url());
+
         if (serviceRepository.existsByNameIgnoreCase(trimmedName)) {
             throw new DuplicateResourceException("Service", "name", trimmedName);
         }
@@ -44,7 +47,7 @@ public class ServiceManagementServiceImpl implements ServiceManagementService {
         MonitoredService service = new MonitoredService(
                 trimmedName,
                 request.description(),
-                request.url(),
+                trimmedUrl,
                 request.getResolvedCheckIntervalSeconds(),
                 request.getResolvedTimeoutMs()
         );
@@ -65,16 +68,25 @@ public class ServiceManagementServiceImpl implements ServiceManagementService {
     @Override
     public Page<ServiceResponse> listServices(Boolean enabled, ServiceStatus status, Pageable pageable) {
         log.debug("Listing monitored services with filters: enabled={}, status={}", enabled, status);
+        Pageable effectivePageable = pageable;
+        if (pageable != null && pageable.isPaged() && pageable.getPageSize() > MAX_PAGE_SIZE) {
+            effectivePageable = org.springframework.data.domain.PageRequest.of(
+                    Math.max(0, pageable.getPageNumber()),
+                    MAX_PAGE_SIZE,
+                    pageable.getSort()
+            );
+        }
+
         Page<MonitoredService> services;
 
         if (enabled != null && status != null) {
-            services = serviceRepository.findByEnabledAndStatus(enabled, status, pageable);
+            services = serviceRepository.findByEnabledAndStatus(enabled, status, effectivePageable);
         } else if (enabled != null) {
-            services = serviceRepository.findByEnabled(enabled, pageable);
+            services = serviceRepository.findByEnabled(enabled, effectivePageable);
         } else if (status != null) {
-            services = serviceRepository.findByStatus(status, pageable);
+            services = serviceRepository.findByStatus(status, effectivePageable);
         } else {
-            services = serviceRepository.findAll(pageable);
+            services = serviceRepository.findAll(effectivePageable);
         }
 
         return services.map(ServiceResponse::from);
@@ -87,7 +99,9 @@ public class ServiceManagementServiceImpl implements ServiceManagementService {
         MonitoredService service = serviceRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Service", id));
 
-        String trimmedName = request.name().trim();
+        String trimmedName = validateAndTrimName(request.name());
+        String trimmedUrl = validateAndTrimUrl(request.url());
+
         if (serviceRepository.existsByNameIgnoreCaseAndIdNot(trimmedName, id)) {
             throw new DuplicateResourceException("Service", "name", trimmedName);
         }
@@ -95,13 +109,49 @@ public class ServiceManagementServiceImpl implements ServiceManagementService {
         service.updateConfiguration(
                 trimmedName,
                 request.description(),
-                request.url(),
+                trimmedUrl,
                 request.checkIntervalSeconds(),
                 request.timeoutMs()
         );
 
         log.info("Successfully updated service configuration for ID: '{}'", id);
         return ServiceResponse.from(service);
+    }
+
+    private String validateAndTrimName(String name) {
+        if (name == null) {
+            throw new IllegalArgumentException("Service name must not be null");
+        }
+        String trimmed = name.trim();
+        if (trimmed.length() < 2 || trimmed.length() > 100) {
+            throw new IllegalArgumentException("Service name must be between 2 and 100 non-whitespace characters");
+        }
+        return trimmed;
+    }
+
+    private String validateAndTrimUrl(String url) {
+        if (url == null || url.isBlank()) {
+            throw new IllegalArgumentException("Service URL must not be blank");
+        }
+        String trimmed = url.trim();
+        final java.net.URI uri;
+        try {
+            uri = java.net.URI.create(trimmed);
+        } catch (IllegalArgumentException ex) {
+            throw new IllegalArgumentException("Service URL is malformed");
+        }
+        String scheme = uri.getScheme();
+        if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+            throw new IllegalArgumentException("Service URL scheme must be http or https");
+        }
+        if (uri.getHost() == null || uri.getHost().isBlank()) {
+            throw new IllegalArgumentException("Service URL must include a valid host");
+        }
+        int port = uri.getPort();
+        if (port == 0 || port > 65535) {
+            throw new IllegalArgumentException("Service URL port must be between 1 and 65535");
+        }
+        return trimmed;
     }
 
     @Override

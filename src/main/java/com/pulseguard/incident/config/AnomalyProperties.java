@@ -126,7 +126,9 @@ public class AnomalyProperties {
     }
 
     public void setLatencyRegressionMultiplier(double latencyRegressionMultiplier) {
-        this.latencyRegressionMultiplier = Math.max(1.0, latencyRegressionMultiplier);
+        if (!Double.isNaN(latencyRegressionMultiplier) && !Double.isInfinite(latencyRegressionMultiplier)) {
+            this.latencyRegressionMultiplier = Math.max(1.0, latencyRegressionMultiplier);
+        }
     }
 
     public long getMinAnomalyLatencyMs() {
@@ -150,7 +152,9 @@ public class AnomalyProperties {
     }
 
     public void setCriticalLatencyMultiplier(double criticalLatencyMultiplier) {
-        this.criticalLatencyMultiplier = Math.max(1.0, criticalLatencyMultiplier);
+        if (!Double.isNaN(criticalLatencyMultiplier) && !Double.isInfinite(criticalLatencyMultiplier)) {
+            this.criticalLatencyMultiplier = Math.max(1.0, criticalLatencyMultiplier);
+        }
     }
 
     public long getCriticalLatencyThresholdMs() {
@@ -166,7 +170,9 @@ public class AnomalyProperties {
     }
 
     public void setErrorRateThreshold(double errorRateThreshold) {
-        this.errorRateThreshold = Math.max(0.0, Math.min(1.0, errorRateThreshold));
+        if (!Double.isNaN(errorRateThreshold) && !Double.isInfinite(errorRateThreshold)) {
+            this.errorRateThreshold = Math.max(0.0, Math.min(1.0, errorRateThreshold));
+        }
     }
 
     public double getCriticalErrorRateThreshold() {
@@ -174,7 +180,9 @@ public class AnomalyProperties {
     }
 
     public void setCriticalErrorRateThreshold(double criticalErrorRateThreshold) {
-        this.criticalErrorRateThreshold = Math.max(0.0, Math.min(1.0, criticalErrorRateThreshold));
+        if (!Double.isNaN(criticalErrorRateThreshold) && !Double.isInfinite(criticalErrorRateThreshold)) {
+            this.criticalErrorRateThreshold = Math.max(0.0, Math.min(1.0, criticalErrorRateThreshold));
+        }
     }
 
     public int getConsecutiveBreachesThreshold() {
@@ -202,7 +210,7 @@ public class AnomalyProperties {
     }
 
     public int getMaxHistoryChecks() {
-        return maxHistoryChecks;
+        return Math.max(maxHistoryChecks, minSamples);
     }
 
     public void setMaxHistoryChecks(int maxHistoryChecks) {

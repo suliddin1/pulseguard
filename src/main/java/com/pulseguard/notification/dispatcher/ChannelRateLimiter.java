@@ -61,7 +61,8 @@ public class ChannelRateLimiter {
             buckets.put(channel, bucket);
             return bucket;
         }
-        double elapsedMinutes = (now - bucket.lastRefillNanos) / 60_000_000_000.0;
+        long elapsedNanos = Math.max(0L, now - bucket.lastRefillNanos);
+        double elapsedMinutes = elapsedNanos / 60_000_000_000.0;
         bucket.tokens = Math.min(perMinute, bucket.tokens + elapsedMinutes * perMinute);
         bucket.lastRefillNanos = now;
         return bucket;

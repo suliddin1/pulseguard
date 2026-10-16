@@ -116,7 +116,7 @@ public class SafeSocketHttpClient implements OutboundHttpClient {
             Socket active = plain;
             try {
                 if (destination.tls()) {
-                    active = upgradeToTls(plain, destination);
+                    active = upgradeToTls(plain, destination, deadlineNanos);
                 }
                 // Once the request may have been written we never replay it on another address.
                 return exchange(active, requestHead, body, deadlineNanos);
@@ -128,7 +128,7 @@ public class SafeSocketHttpClient implements OutboundHttpClient {
         throw lastFailure != null ? lastFailure : new IOException("connection failed");
     }
 
-    private Socket upgradeToTls(Socket plain, ResolvedDestination destination) throws IOException {
+    private Socket upgradeToTls(Socket plain, ResolvedDestination destination, long deadlineNanos) throws IOException {
         SSLSocket ssl = (SSLSocket) sslSocketFactory.createSocket(plain, destination.host(), destination.port(), true);
         try {
             SSLParameters parameters = ssl.getSSLParameters();
@@ -136,10 +136,14 @@ public class SafeSocketHttpClient implements OutboundHttpClient {
             parameters.setEndpointIdentificationAlgorithm("HTTPS");
             parameters.setProtocols(new String[]{"TLSv1.3", "TLSv1.2"});
             if (!looksLikeIp(destination.host())) {
-                parameters.setServerNames(List.of(new SNIHostName(destination.host())));
+                try {
+                    parameters.setServerNames(List.of(new SNIHostName(destination.host())));
+                } catch (IllegalArgumentException ex) {
+                    throw new PermanentDeliveryException("invalid TLS SNI host name");
+                }
             }
             ssl.setSSLParameters(parameters);
-            ssl.setSoTimeout((int) Math.min(Integer.MAX_VALUE, readTimeout.toMillis()));
+            ssl.setSoTimeout(toMillis(readTimeout, deadlineNanos));
             ssl.startHandshake();
             return ssl;
         } catch (IOException | RuntimeException ex) {
@@ -156,6 +160,15 @@ public class SafeSocketHttpClient implements OutboundHttpClient {
         out.flush();
 
         InputStream in = socket.getInputStream();
+        int status = readStatusLine(socket, in, deadlineNanos);
+        while (status >= 100 && status < 200) {
+            skipInterimHeaders(socket, in, deadlineNanos);
+            status = readStatusLine(socket, in, deadlineNanos);
+        }
+        return status;
+    }
+
+    private int readStatusLine(Socket socket, InputStream in, long deadlineNanos) throws IOException {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         while (true) {
             socket.setSoTimeout(toMillis(readTimeout, deadlineNanos));
@@ -172,6 +185,31 @@ public class SafeSocketHttpClient implements OutboundHttpClient {
             line.write(next);
         }
         return parseStatus(line.toString(StandardCharsets.ISO_8859_1));
+    }
+
+    private void skipInterimHeaders(Socket socket, InputStream in, long deadlineNanos) throws IOException {
+        int totalRead = 0;
+        ByteArrayOutputStream line = new ByteArrayOutputStream();
+        while (true) {
+            socket.setSoTimeout(toMillis(readTimeout, deadlineNanos));
+            int next = in.read();
+            if (next < 0) {
+                throw new IOException("connection closed during interim response headers");
+            }
+            totalRead++;
+            if (totalRead > MAX_STATUS_LINE_BYTES) {
+                throw new PermanentDeliveryException("interim response headers exceed the size limit");
+            }
+            if (next == '\n') {
+                String headerLine = line.toString(StandardCharsets.ISO_8859_1).trim();
+                line.reset();
+                if (headerLine.isEmpty()) {
+                    return;
+                }
+            } else {
+                line.write(next);
+            }
+        }
     }
 
     static int parseStatus(String statusLine) throws PermanentDeliveryException {

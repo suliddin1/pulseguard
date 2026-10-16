@@ -76,4 +76,20 @@ class ChannelRateLimiterTest {
             assertThat(limiter.tryAcquire(NotificationChannelType.WEBHOOK)).isTrue();
         }
     }
+
+    @Test
+    @DisplayName("Backward clock jump does not drain remaining tokens")
+    void backwardClockJumpDoesNotDrainTokens() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-10-10T12:05:00Z"));
+        ChannelRateLimiter limiter = new ChannelRateLimiter(clock, 2);
+
+        // Consume 1 token -> 1 token remains
+        assertThat(limiter.tryAcquire(NotificationChannelType.WEBHOOK)).isTrue();
+
+        // Simulate backward NTP jump of 2 minutes
+        clock.advance(Duration.ofMinutes(-2));
+
+        // Remaining token must still be available
+        assertThat(limiter.tryAcquire(NotificationChannelType.WEBHOOK)).isTrue();
+    }
 }

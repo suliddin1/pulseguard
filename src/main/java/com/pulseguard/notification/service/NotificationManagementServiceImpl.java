@@ -29,6 +29,11 @@ public class NotificationManagementServiceImpl implements NotificationManagement
 
     private static final int MAX_PAGE_SIZE = 100;
     private static final Sort DEFAULT_SORT = Sort.by(Sort.Direction.DESC, "createdAt");
+    private static final java.util.Set<String> ALLOWED_SORT_FIELDS = java.util.Set.of(
+            "id", "eventId", "channel", "eventType", "incidentId", "serviceId",
+            "status", "attemptCount", "nextAttemptAt", "lastHttpStatus",
+            "createdAt", "updatedAt", "deliveredAt"
+    );
 
     private final NotificationOutboxRepository outboxRepository;
     private final NotificationAttemptRepository attemptRepository;
@@ -80,6 +85,14 @@ public class NotificationManagementServiceImpl implements NotificationManagement
     }
 
     private Pageable sanitizePageable(Pageable pageable) {
+        if (pageable == null || pageable.isUnpaged()) {
+            return PageRequest.of(0, 20, DEFAULT_SORT);
+        }
+        for (Sort.Order order : pageable.getSort()) {
+            if (!ALLOWED_SORT_FIELDS.contains(order.getProperty())) {
+                throw new IllegalArgumentException("Unsupported sort property: '" + order.getProperty() + "'");
+            }
+        }
         int pageSize = Math.min(Math.max(1, pageable.getPageSize()), MAX_PAGE_SIZE);
         Sort sort = pageable.getSort().isSorted() ? pageable.getSort() : DEFAULT_SORT;
         return PageRequest.of(Math.max(0, pageable.getPageNumber()), pageSize, sort);

@@ -103,9 +103,23 @@ public class IncidentManagementServiceImpl implements IncidentManagementService 
                 .map(IncidentResponse::from);
     }
 
+    private static final java.util.Set<String> ALLOWED_SORT_FIELDS = java.util.Set.of(
+            "id", "incidentType", "severity", "status", "summary",
+            "startedAt", "lastOccurrenceAt", "resolvedAt", "occurrenceCount",
+            "createdAt", "updatedAt"
+    );
+
     private Pageable createBoundedPageable(Pageable pageable) {
-        int boundedPageSize = Math.min(pageable.getPageSize(), MAX_PAGE_SIZE);
+        if (pageable == null || pageable.isUnpaged()) {
+            return PageRequest.of(0, 20, DEFAULT_SORT);
+        }
+        for (Sort.Order order : pageable.getSort()) {
+            if (!ALLOWED_SORT_FIELDS.contains(order.getProperty())) {
+                throw new IllegalArgumentException("Unsupported sort property: '" + order.getProperty() + "'");
+            }
+        }
+        int boundedPageSize = Math.min(Math.max(1, pageable.getPageSize()), MAX_PAGE_SIZE);
         Sort sort = pageable.getSort().isSorted() ? pageable.getSort() : DEFAULT_SORT;
-        return PageRequest.of(pageable.getPageNumber(), boundedPageSize, sort);
+        return PageRequest.of(Math.max(0, pageable.getPageNumber()), boundedPageSize, sort);
     }
 }

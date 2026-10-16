@@ -100,11 +100,25 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
         }
     }
 
+    private List<HealthCheck> loadRecentChecks(UUID serviceId, int threshold) {
+        if (threshold <= 10) {
+            return healthCheckRepository.findTop10ByServiceIdOrderByCheckedAtDesc(serviceId);
+        }
+        return healthCheckRepository.findByServiceId(
+                serviceId,
+                org.springframework.data.domain.PageRequest.of(
+                        0,
+                        threshold,
+                        org.springframework.data.domain.Sort.by(org.springframework.data.domain.Sort.Direction.DESC, "checkedAt")
+                )
+        ).getContent();
+    }
+
     private void evaluateFailure(MonitoredService service, HealthCheck healthCheck) {
         UUID serviceId = service.getId();
         int threshold = incidentProperties.getConsecutiveFailuresThreshold();
 
-        List<HealthCheck> recentChecks = healthCheckRepository.findTop10ByServiceIdOrderByCheckedAtDesc(serviceId);
+        List<HealthCheck> recentChecks = loadRecentChecks(serviceId, threshold);
 
         int consecutiveFailures = 0;
         Instant firstFailureInStreak = healthCheck.getCheckedAt();
@@ -128,8 +142,8 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
             Incident openIncident = openIncidentOpt.get();
             openIncident.recordOccurrence(healthCheck.getCheckedAt(), healthCheck.getErrorMessage());
             incidentRepository.save(openIncident);
-            incidentMetrics.recordOccurrence();
             notificationEnqueuer.incidentOccurrence(openIncident);
+            incidentMetrics.recordOccurrence();
             log.info("Recorded incident occurrence for service '{}' (Incident ID: {}). Count: {}",
                     service.getName(), openIncident.getId(), openIncident.getOccurrenceCount());
         } else if (consecutiveFailures >= threshold) {
@@ -155,21 +169,13 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
 
             try {
                 Incident saved = incidentRepository.save(newIncident);
-                incidentMetrics.recordCreated();
                 notificationEnqueuer.incidentOpened(saved);
+                incidentMetrics.recordCreated();
                 log.warn("Created new incident for service '{}' (Incident ID: {}): severity={}, summary='{}'",
                         service.getName(), saved.getId(), saved.getSeverity(), saved.getSummary());
             } catch (DataIntegrityViolationException ex) {
                 log.warn("Concurrent incident creation caught by unique constraint for service '{}', falling back to occurrence update",
                         service.getName());
-                incidentRepository.findByServiceIdAndIncidentTypeAndStatus(
-                        serviceId, IncidentType.SERVICE_UNAVAILABLE, IncidentStatus.OPEN
-                ).ifPresent(existing -> {
-                    existing.recordOccurrence(healthCheck.getCheckedAt(), healthCheck.getErrorMessage());
-                    incidentRepository.save(existing);
-                    incidentMetrics.recordOccurrence();
-                    notificationEnqueuer.incidentOccurrence(existing);
-                });
             }
         }
     }
@@ -186,7 +192,7 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
         }
 
         int recoveryThreshold = incidentProperties.getConsecutiveSuccessesThreshold();
-        List<HealthCheck> recentChecks = healthCheckRepository.findTop10ByServiceIdOrderByCheckedAtDesc(serviceId);
+        List<HealthCheck> recentChecks = loadRecentChecks(serviceId, recoveryThreshold);
 
         int consecutiveSuccesses = 0;
         for (HealthCheck check : recentChecks) {
@@ -211,11 +217,14 @@ public class IncidentDetectionServiceImpl implements IncidentDetectionService {
 
             openIncident.resolve(healthCheck.getCheckedAt(), resolutionDetails);
             incidentRepository.save(openIncident);
-            incidentMetrics.recordResolved();
             notificationEnqueuer.incidentResolved(openIncident);
+            incidentMetrics.recordResolved();
 
             log.info("Resolved incident for service '{}' (Incident ID: {}). Resolved at: {}",
                     service.getName(), openIncident.getId(), openIncident.getResolvedAt());
+        } else {
+            // Service still has an open SERVICE_UNAVAILABLE incident awaiting more consecutive successes
+            service.updateStatus(com.pulseguard.service.model.ServiceStatus.UNHEALTHY);
         }
     }
 }

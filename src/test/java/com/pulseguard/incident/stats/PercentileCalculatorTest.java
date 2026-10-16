@@ -92,12 +92,14 @@ class PercentileCalculatorTest {
     }
 
     @Test
-    @DisplayName("Percentile out of [0, 100] range throws IllegalArgumentException")
+    @DisplayName("Percentile out of [0, 100] range or NaN throws IllegalArgumentException")
     void outOfRangeThrows() {
         List<Long> values = List.of(10L, 20L);
         assertThatThrownBy(() -> PercentileCalculator.calculatePercentile(values, -1.0))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> PercentileCalculator.calculatePercentile(values, 100.1))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> PercentileCalculator.calculatePercentile(values, Double.NaN))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 }

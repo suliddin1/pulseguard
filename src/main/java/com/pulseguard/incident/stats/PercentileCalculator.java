@@ -34,7 +34,7 @@ public final class PercentileCalculator {
         if (sortedValues.isEmpty()) {
             throw new IllegalArgumentException("Cannot compute percentile on an empty list");
         }
-        if (percentile < 0.0 || percentile > 100.0) {
+        if (Double.isNaN(percentile) || percentile < 0.0 || percentile > 100.0) {
             throw new IllegalArgumentException("Percentile must be between 0.0 and 100.0, got: " + percentile);
         }
 
